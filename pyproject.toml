@@ -32,9 +32,9 @@ classifiers = [
 bluray-fidelity = "bluray_fidelity.cli:main"
 
 [project.urls]
-Homepage = "https://github.com/bluray-mkv-fidelity/bluray-mkv-fidelity"
-Repository = "https://github.com/bluray-mkv-fidelity/bluray-mkv-fidelity"
-Issues = "https://github.com/bluray-mkv-fidelity/bluray-mkv-fidelity/issues"
+Homepage = "https://github.com/principal0324/bluray-mkv-fidelity"
+Repository = "https://github.com/principal0324/bluray-mkv-fidelity"
+Issues = "https://github.com/principal0324/bluray-mkv-fidelity/issues"
 
 [tool.setuptools.packages.find]
 where = ["src"]
