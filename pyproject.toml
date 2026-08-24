@@ -1,0 +1,43 @@
+[build-system]
+requires = ["setuptools>=68.0", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "bluray-mkv-fidelity"
+version = "0.1.0"
+description = "Dolby Vision Profile 7 保真交付工具链 — 从 Blu-ray BDMV/ISO 精确还原 MKV"
+readme = "README.md"
+license = "Apache-2.0"
+requires-python = ">=3.10"
+authors = [
+    { name = "bluray-mkv-fidelity contributors" },
+]
+keywords = ["blu-ray", "dolby-vision", "mkv", "matroska", "hdr10", "profile-7", "bdmv"]
+classifiers = [
+    "Development Status :: 4 - Beta",
+    "Intended Audience :: Developers",
+    "Intended Audience :: End Users/Desktop",
+    "License :: OSI Approved :: Apache Software License",
+    "Operating System :: OS Independent",
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3.10",
+    "Programming Language :: Python :: 3.11",
+    "Programming Language :: Python :: 3.12",
+    "Programming Language :: Python :: 3.13",
+    "Topic :: Multimedia :: Video",
+    "Topic :: Multimedia :: Sound/Audio",
+]
+
+[project.scripts]
+bluray-fidelity = "bluray_fidelity.cli:main"
+
+[project.urls]
+Homepage = "https://github.com/bluray-mkv-fidelity/bluray-mkv-fidelity"
+Repository = "https://github.com/bluray-mkv-fidelity/bluray-mkv-fidelity"
+Issues = "https://github.com/bluray-mkv-fidelity/bluray-mkv-fidelity/issues"
+
+[tool.setuptools.packages.find]
+where = ["src"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
