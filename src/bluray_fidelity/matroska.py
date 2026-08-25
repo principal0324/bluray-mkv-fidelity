@@ -2289,6 +2289,14 @@ def _verify_cues_and_seek(probe: str, output: Path, duration_ns: int,
 
         # ===== 非 DV 路线（原逻辑不变）=====
         frames = _probe_interval_frames(probe, output, target, diag=point)
+        if not frames:
+            # Retry with a wider but bounded decoder window before rejecting.
+            point["fallback_frame_probe"] = "widened_60s"
+            frames = _probe_interval_frames(
+                probe, output, target, diag=point,
+                lookback_seconds=_SEEK_FALLBACK_LOOKBACK_SECONDS,
+            )
+            point["fallback_frame_count"] = len(frames)
         point["frame_count"] = len(frames)
         point["first_frame_seconds"] = frames[0] if frames else None
         point["last_frame_seconds"] = frames[-1] if frames else None
@@ -2530,6 +2538,7 @@ def _count_decoded_frames(probe: str, es_path: Path) -> int:
 
 _SEEK_TARGETS: tuple[float, ...] = (0.10, 0.50, 0.90)
 _SEEK_WINDOW_SECONDS = 10.0
+_SEEK_FALLBACK_LOOKBACK_SECONDS = 60.0
 _SEEK_FRAME_TOLERANCE = 20.0
 _DV_EXTRACT_FRAME_CAP = 2000  # round-21：DV 窗口抽取预算的有界硬上限
 _DV_EXTRACT_FRAME_TAIL = 10   # round-21：覆盖门槛之外的尾部抽取余量（仅抽取，非通过门槛）
@@ -2584,12 +2593,27 @@ def _probe_interval_packets(probe: str, path: Path, target: float,
 
 
 def _probe_interval_frames(probe: str, path: Path, target: float,
-                           diag: dict | None = None) -> list[float]:
+                           diag: dict | None = None,
+                           *, lookback_seconds: float = _SEEK_WINDOW_SECONDS) -> list[float]:
     """读目标时间窗口内选中视频流的 decoded frame 时间（best_effort）。
     子进程 rc/stderr/命令写入 diag（Codex P1-3 增量诊断）。"""
+    # ffprobe's interval seek is allowed to start exactly at ``target`` for
+    # packet inspection, but that is too strict for decoded frames: when the
+    # nearest preceding keyframe is outside the interval, ffprobe can return
+    # packets yet decode zero frames.  Decode from a bounded keyframe-friendly
+    # window around the target and let the caller enforce the timestamp
+    # tolerance.  This keeps the check seekable while avoiding false failures
+    # on long Blu-ray streams with sparse keyframes.
+    interval_start = max(0.0, target - lookback_seconds)
+    interval_duration = lookback_seconds * 2
     command = [
         probe, "-v", "error", "-select_streams", "v:0",
-        "-read_intervals", f"{target:.3f}%+{_SEEK_WINDOW_SECONDS}",
+        # Seek validation only needs decodable keyframe anchors inside the
+        # bounded tolerance window.  Decoding every frame in a 120-second
+        # UHD window can exceed the watchdog on low-power NAS CPUs even
+        # when packet/Cue evidence is valid.
+        "-skip_frame", "nokey",
+        "-read_intervals", f"{interval_start:.3f}%+{interval_duration}",
         "-show_frames",
         "-show_entries", "frame=best_effort_timestamp_time",
         "-of", "csv=p=0", str(path),
@@ -2616,10 +2640,54 @@ def _probe_interval_frames(probe: str, path: Path, target: float,
         line = line.strip()
         if not line:
             continue
+        # ffprobe's CSV writer appends frame side-data fields after the
+        # timestamp (for example HDR mastering-display/content-light-level
+        # metadata).  The timestamp remains the first CSV field; parsing the
+        # whole line made valid HDR10 frames look non-numeric and caused a
+        # false "packets but no frames" rejection.
+        timestamp = line.split(",", 1)[0].strip()
         try:
-            times.append(float(line))
+            times.append(float(timestamp))
         except ValueError:
             continue
+    # Some remuxed UHD streams carry valid packet/Cue key access units but do
+    # not expose them as decoded ``nokey`` frames through ffprobe.  A bounded
+    # ordinary-frame retry avoids rejecting an otherwise seekable output while
+    # retaining a hard time/CPU bound (and never falls back to a full scan).
+    if not times:
+        fallback_command = [
+            probe, "-v", "error", "-select_streams", "v:0",
+            "-read_intervals", f"{interval_start:.3f}%+{interval_duration}",
+            "-show_frames",
+            "-show_entries", "frame=best_effort_timestamp_time",
+            "-of", "csv=p=0", str(path),
+        ]
+        if diag is not None:
+            diag["frame_fallback_command"] = " ".join(fallback_command)
+        try:
+            fallback = subprocess.run(
+                fallback_command, check=True, capture_output=True,
+                text=True, timeout=180,
+            )
+        except (OSError, subprocess.SubprocessError) as error:
+            if diag is not None:
+                diag["frame_fallback_rc"] = getattr(error, "returncode", None)
+                diag["frame_fallback_stderr"] = str(
+                    getattr(error, "stderr", None) or error
+                )[-300:]
+            return []
+        if diag is not None:
+            diag["frame_fallback_rc"] = fallback.returncode
+            diag["frame_fallback_stderr"] = (fallback.stderr or "")[-300:]
+        for line in fallback.stdout.splitlines():
+            line = line.strip()
+            if not line:
+                continue
+            timestamp = line.split(",", 1)[0].strip()
+            try:
+                times.append(float(timestamp))
+            except ValueError:
+                continue
     return times
 
 

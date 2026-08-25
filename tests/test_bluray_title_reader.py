@@ -40,7 +40,7 @@ def test_probe_main_title_parses_selected_record(tmp_path: Path, monkeypatch):
 
 def test_native_probe_emits_stream_metadata_for_automatic_titles():
     """The native --probe path must carry streams, not only SELECTED."""
-    source = Path(__file__).parents[1] / "tools/bluray-title-reader/bluray_title_reader.cpp"
+    source = Path(__file__).parents[1] / "native/bluray-title-reader/bluray_title_reader.cpp"
     text = source.read_text()
     probe_body = text.split("int probe(", 1)[1].split("int list_titles(", 1)[0]
 
@@ -188,7 +188,7 @@ def test_probe_main_title_prefers_near_equal_playlist_with_chinese_tracks(
 
 
 def test_native_stream_probe_scans_every_mpls_clip():
-    source = Path(__file__).parents[1] / "tools/bluray-title-reader/bluray_title_reader.cpp"
+    source = Path(__file__).parents[1] / "native/bluray-title-reader/bluray_title_reader.cpp"
     text = source.read_text()
     stream_body = text.split("void print_streams(", 1)[1].split("bool read_exact(", 1)[0]
 
@@ -200,7 +200,7 @@ def test_native_stream_probe_emits_ordered_clip_fingerprint():
     """The native helper must expose the ordered MPLS clip sequence
     (clip_id + 90 kHz in/out points) so the edition graph can compare
     playlists strictly and never split a multi-clip seamless title."""
-    source = Path(__file__).parents[1] / "tools/bluray-title-reader/bluray_title_reader.cpp"
+    source = Path(__file__).parents[1] / "native/bluray-title-reader/bluray_title_reader.cpp"
     text = source.read_text()
     stream_body = text.split("void print_streams(", 1)[1].split("bool read_exact(", 1)[0]
 
@@ -258,7 +258,7 @@ def test_probe_main_title_parses_vinfo_video_attributes(tmp_path: Path, monkeypa
 def test_native_stream_probe_emits_vinfo_video_attributes():
     """The native helper must emit authoritative video format/rate (VINFO),
     never a guessed resolution."""
-    source = Path(__file__).parents[1] / "tools/bluray-title-reader/bluray_title_reader.cpp"
+    source = Path(__file__).parents[1] / "native/bluray-title-reader/bluray_title_reader.cpp"
     text = source.read_text()
     stream_body = text.split("void print_streams(", 1)[1].split("bool read_exact(", 1)[0]
 
