@@ -16,8 +16,11 @@ MakeMKV 是优秀的通用 MKV 提取工具，但在 Dolby Vision Profile 7 场�
 - **独立证据链**：RPU 载荷 10%/50%/90% 窗口校验 + EL 有序一致性 + ffprobe dvcC 权威门
 - **fail-closed**：任何一环不通过就不发布
 - **HDR10+ 精确处理**：NAL 级 T.35 SEI 剥离，保留静态 HDR10
-- **EBML 结构化校验**：按元素边界遍历 Cues，非裸字节搜索
+- **EBML 结构化校验**：按元素边界遍历 Cues，非裸字节搜索；大型 Cues 有界流式计数（跨 chunk EBML 边界分类，保持 fail-closed）
 - **多点 seek 验证**：10%/50%/90% 时间点 BL 解码正交验证
+- **多 m2ts 合辑 DV 段级封装**：逐段 BL+EL 合并 + 纯追加拼接，接缝连续性门（3.7.111–3.7.118 系列修复）
+- **字幕覆盖证据门**：稀疏字幕缺口按源包时间线证明（`dense_sample_windows` / `longest_uncovered_gap`），字幕中途整段消失无法通过发布门
+- **ISO/UDF 直读**：不经 libbluray 的 ISO 挂载路径（规避 TS PID 改写问题），源损伤就地补包并留痕（`source_damage_records`）
 
 ## 快速开始
 
@@ -106,6 +109,8 @@ bluray-fidelity probe/verify   ← CLI 入口
     │   └── dovi_tool           (外部)
     │
     └── m2ts.py                 ← 直接 M2TS 提取（不经封装）
+
+    udf_media.py                ← ISO/UDF 直读（libudfread 绑定，缺库时明确降级不可用）
 ```
 
 ## 测试

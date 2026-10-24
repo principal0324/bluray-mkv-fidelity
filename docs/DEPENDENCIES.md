@@ -106,3 +106,4 @@ pytest tests/
 - Python ≥ 3.10
 - C++17 编译器（编译 C++ helper 时）
 - libbluray（C++ helper 链接时）
+- libudfread（可选：ISO/UDF 直读路径的运行期依赖；缺失时 ISO 成员读取明确报不可用，不在导入期失败）

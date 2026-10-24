@@ -1,11 +1,15 @@
 from pathlib import Path
 
+import json
+import pathlib
+
 import pytest
 
 from dataclasses import replace
-from bluray_fidelity.bluray import BlurayTitleAsset, BlurayTrack
+from bluray_fidelity.bluray import BlurayClip, BlurayTitleAsset, BlurayTrack
 from bluray_fidelity.matroska import (
     MatroskaBuildError,
+    MatroskaBuilder,
     build_mkvmerge_command,
     parse_identification,
     resolve_official_tracks,
@@ -73,6 +77,81 @@ def test_identification_accepts_mkvmerge_hexadecimal_transport_stream_pids():
     assert identified[2].stream_id == 4352
 
 
+def _vietnam_style_asset(tmp_path: Path) -> BlurayTitleAsset:
+    """越南战争 S01E09 主片（playlist 3，19 个 play item）的官方音轨表形态。
+
+    实测 `--streams` 合并结果：PID 4354 被声明两次——index 2 记 `spa`、
+    index 4 记 `eng`（17 段共用一个 clip，跨片段语言不同）。
+    """
+    asset = _asset(tmp_path)
+    return BlurayTitleAsset(
+        **{**asset.__dict__, "audio_tracks": (
+            BlurayTrack(index=0, pid=4352, coding_type=0x86, language="eng"),
+            BlurayTrack(index=1, pid=4353, coding_type=0x86, language="eng"),
+            BlurayTrack(index=2, pid=4354, coding_type=0x86, language="spa"),
+            BlurayTrack(index=3, pid=4355, coding_type=0x86, language="eng"),
+            BlurayTrack(index=4, pid=4354, coding_type=0x86, language="eng"),
+        ), "subtitle_tracks": (
+            BlurayTrack(index=0, pid=4608, coding_type=0x90, language="eng"),
+            BlurayTrack(index=1, pid=4609, coding_type=0x90, language="spa"),
+        )}
+    )
+
+
+def _vietnam_style_identification(payload_4354_language: str) -> dict:
+    return {
+        "container": {"properties": {"duration": 100_000_000_000}},
+        "tracks": [
+            {"id": 0, "type": "video", "codec": "AVC", "properties": {"stream_id": 4113}},
+            {"id": 1, "type": "audio", "codec": "DTS-HD Master Audio",
+             "properties": {"stream_id": 4352, "language": "eng"}},
+            {"id": 2, "type": "audio", "codec": "DTS-HD Master Audio",
+             "properties": {"stream_id": 4353, "language": "eng"}},
+            {"id": 3, "type": "audio", "codec": "DTS-HD Master Audio",
+             "properties": {"stream_id": 4354, "language": payload_4354_language}},
+            {"id": 4, "type": "audio", "codec": "DTS-HD Master Audio",
+             "properties": {"stream_id": 4355, "language": "eng"}},
+            {"id": 5, "type": "subtitles", "codec": "HDMV PGS",
+             "properties": {"stream_id": 4608, "language": "eng"}},
+            {"id": 6, "type": "subtitles", "codec": "HDMV PGS",
+             "properties": {"stream_id": 4609, "language": "spa"}},
+        ],
+    }
+
+
+def test_duplicate_mpls_pid_maps_to_one_output_track(tmp_path: Path):
+    """同一 PID 被官方表声明两次时，只能占用一条输出轨。
+
+    否则成品条数比"可映射"少一条，会在数量门被拒（2026-09-14 越南战争：
+    成品 4 条 vs 可映射 5 条，来源完好却失败在计数上）。
+    """
+    asset = _vietnam_style_asset(tmp_path)
+
+    resolved = resolve_official_tracks(
+        asset, parse_identification(_vietnam_style_identification("eng")))
+
+    assert len(resolved.audio_ids) == len(set(resolved.audio_ids))
+    assert len(resolved.audio_by_official_index) == len(resolved.audio_ids)
+    assert resolved.audio_ids == (1, 2, 3, 4)
+
+
+def test_duplicate_pid_keeps_declaration_matching_identified_language(tmp_path: Path):
+    """重复声明的取舍必须与输入轨实际语言一致，否则语言门会误拒。"""
+    asset = _vietnam_style_asset(tmp_path)
+
+    # 输入轨 4354 实为 eng → 应保留 index 4（eng），丢弃 index 2（spa）。
+    resolved_eng = resolve_official_tracks(
+        asset, parse_identification(_vietnam_style_identification("eng")))
+    assert (4, 3) in resolved_eng.audio_by_official_index
+    assert all(index != 2 for index, _ in resolved_eng.audio_by_official_index)
+
+    # 输入轨 4354 实为 spa → 应保留先到的 index 2（spa）。
+    resolved_spa = resolve_official_tracks(
+        asset, parse_identification(_vietnam_style_identification("spa")))
+    assert (2, 3) in resolved_spa.audio_by_official_index
+    assert all(index != 4 for index, _ in resolved_spa.audio_by_official_index)
+
+
 def test_resolver_skips_stale_mpls_entry_when_mkvmerge_has_no_packets(tmp_path: Path):
     asset = _asset(tmp_path)
     payload = _input_identification()
@@ -110,6 +189,52 @@ def test_command_preserves_all_video_layers_and_sets_chinese_defaults(tmp_path: 
     assert "5:no" in command
     assert "6:yes" in command
     assert command[-1] == str(fifo)
+
+
+def test_command_append_uses_explicit_track_selection_and_mapping(tmp_path):
+    """多段追加：逐轨选择必须同时作用于追加段，并给出只含被复制轨的显式映射。
+
+    生产标本（dlv_93c13946d7c0eac7c0b9 地球脉动.第三季 Disc.3）：首段按
+    `--audio-tracks 2,4`（本例同形）排除了 track 3，而旧实现只给追加段类型级
+    开关 → mkvmerge 默认按位映射给出 `1:3:0:3`，指向首段未被复制的轨 →
+    `#GUI#error … does not contain a track with the ID 3 … --append-to was invalid`
+    （1.3 秒报错退出，交付永远无法完成）。
+    """
+    asset = _asset(tmp_path)
+    resolved = resolve_official_tracks(asset, parse_identification(_input_identification()))
+    first = tmp_path / "title.item0.m2ts"
+    second = tmp_path / "title.item1.m2ts"
+
+    command = build_mkvmerge_command(asset, resolved, first,
+                                     tmp_path / "final.mkv.partial",
+                                     title="十三刺客", append_inputs=(second,))
+
+    # 追加段必须带**同样的逐轨选择**（否则它仍在复制自己的全部轨）
+    plus = command.index("+")
+    appended = command[plus + 1:command.index(str(second))]
+    assert "--audio-tracks" in appended and "2,4" in appended
+    assert "--subtitle-tracks" in appended and "5,6" in appended
+
+    # 显式映射：只含被复制的轨，且覆盖全部被复制轨
+    mapping = command[command.index("--append-to") + 1]
+    assert "1:3:0:3" not in mapping, "被排除的 track 3 绝不能被映射引用"
+    for track_id in (0, 1, 2, 4, 5, 6):
+        assert f"1:{track_id}:0:{track_id}" in mapping
+    assert command[-1] == str(second)
+
+
+def test_command_single_input_has_no_append_mapping(tmp_path):
+    """单段路线零变化：没有 +、没有 --append-to（回归）。"""
+    asset = _asset(tmp_path)
+    resolved = resolve_official_tracks(asset, parse_identification(_input_identification()))
+    source = tmp_path / "title.m2ts"
+
+    command = build_mkvmerge_command(asset, resolved, source,
+                                     tmp_path / "final.mkv.partial", title="十三刺客")
+
+    assert "+" not in command
+    assert "--append-to" not in command
+    assert command[-1] == str(source)
 
 
 def test_validation_accepts_single_video_track_for_dovi_merged_output(tmp_path: Path):
@@ -659,6 +784,10 @@ def test_default_builder_dv_branch_passes_el_source_digests_to_profile7_gate(
 
     monkeypatch.setattr(m.subprocess, "Popen",
                         lambda *a, **k: FakeProcess(*a, **k))
+    # E1 轨覆盖门要对真实成品逐窗口测在场区间；本用例的成品是桩字节（b"mkv"），
+    # 覆盖门在这里没有可驱动的对象（真实媒体证据见
+    # tests/test_matroska_track_coverage.py）。
+    monkeypatch.setattr(m, "require_track_coverage", lambda *a, **k: {})
 
     builder.build(asset, tmp_path / "out.mkv", title="测试")
 
@@ -794,24 +923,36 @@ def test_strip_dynamic_sei_keeps_static_metadata_and_parameters(tmp_path):
 
 
 def test_peak_space_bytes_models_peak_temporary_footprint(tmp_path):
-    """BATCH-001 §5 / P1-2：峰值 = 同槽位同时存活文件最坏情况 + 余量。
+    """BATCH-001 §5 / P1-2 + 2026-09-14 分段：峰值 = 同槽位同时存活文件。
 
-    mkvmerge 路径覆盖普通（≈2×）、DV/PMT-only DV（≈3.6×）、HDR10+
-    （≈3.6×）三种路线，保守统一 4×；FIFO 仅部分成品；FFmpeg-file
-    为主片+部分成品。
+    默认 mkvmerge 路线按分段物化：全部分段（Σ play item 长度，同一 clip K 次
+    引用计 K 份）+ 物化期在写分段 + 在写成品 + 槽位保留的既有成品（末次传输
+    后 15 分钟），单段标题下与既有 4× 逐字一致；FIFO 无物化，只有在写成品 +
+    槽位保留成品；FFmpeg-file 为物化主片 + 在写成品 + 槽位保留成品。
     """
     from bluray_fidelity.matroska import (
         FfmpegFileMatroskaBuilder,
         FifoMatroskaBuilder,
         MatroskaBuilder,
+        default_peak_space_bytes,
     )
 
     asset = _asset(tmp_path)  # size=10_000_000
     gib_safe = 512 * 1024**2
 
     assert MatroskaBuilder().peak_space_bytes(asset) == 4 * 10_000_000 + gib_safe
-    assert FifoMatroskaBuilder().peak_space_bytes(asset) == 10_000_000 + gib_safe
-    assert FfmpegFileMatroskaBuilder().peak_space_bytes(asset) == 2 * 10_000_000 + gib_safe
+    assert default_peak_space_bytes(asset) == 4 * 10_000_000 + gib_safe
+    assert FifoMatroskaBuilder().peak_space_bytes(asset) == 2 * 10_000_000 + gib_safe
+    assert FfmpegFileMatroskaBuilder().peak_space_bytes(asset) == 3 * 10_000_000 + gib_safe
+
+    # 多段合辑：分段字节按 play item 逐段计（同一 clip 被引用 K 次即 K 份），
+    # 峰值仍以完整虚拟流为上界（在写分段按整片保守取值）。
+    multiclip = replace(asset, size=60, clip_count=3, clips=(
+        BlurayClip(index=0, clip_id="00001", in_time=54_000_000, out_time=81_000_000),
+        BlurayClip(index=1, clip_id="00002", in_time=0, out_time=27_000_000),
+        BlurayClip(index=2, clip_id="00001", in_time=54_000_000, out_time=81_000_000),
+    ))
+    assert MatroskaBuilder().peak_space_bytes(multiclip) == 4 * 60 + gib_safe
 
 
 def test_validate_dolby_vision_fact_comes_from_build_not_mpls(tmp_path):
@@ -985,10 +1126,119 @@ def test_count_cue_points_parses_structured_ebml(tmp_path):
     mkv2.write_bytes(no_cues)
     assert _count_cue_points(mkv2) == 0
 
-    # 无 Segment（媒体负载误命中场景）：返回 0。
+    # 无 Segment：这是不可解析输入，不得混同为合法容器中的「无 Cues」。
     junk = tmp_path / "junk.mkv"
     junk.write_bytes(b"\x1c\x53\xbb\x6b" + bytes(64))  # Cues ID 裸字节出现
-    assert _count_cue_points(junk) == 0
+    with pytest.raises(ValueError, match="parse_failed"):
+        _count_cue_points(junk)
+
+
+def _encode_ebml_size_for_test(size: int) -> bytes:
+    for length in range(1, 9):
+        if size < (1 << (7 * length)) - 1:
+            encoded = bytearray(size.to_bytes(length, "big"))
+            encoded[0] |= 1 << (8 - length)
+            return bytes(encoded)
+    raise ValueError("test EBML size too large")
+
+
+def _write_mkv_with_large_cues(path, padding_bytes: int, *, payload_tail=b"\xbb\x80"):
+    """Write a sparse-size test MKV without allocating its full Cues payload."""
+    void_header = b"\xec" + _encode_ebml_size_for_test(padding_bytes)
+    cues_size = len(void_header) + padding_bytes + len(payload_tail)
+    with path.open("wb") as stream:
+        stream.write(b"\x18\x53\x80\x67\x01" + b"\xff" * 7)  # unknown Segment size
+        stream.write(b"\x1c\x53\xbb\x6b" + _encode_ebml_size_for_test(cues_size))
+        stream.write(void_header)
+        block = bytes(64 * 1024)
+        remaining = padding_bytes
+        while remaining:
+            size = min(len(block), remaining)
+            stream.write(block[:size])
+            remaining -= size
+        stream.write(payload_tail)
+
+
+def test_large_cues_after_four_mib_are_counted_with_bounded_memory(tmp_path):
+    import tracemalloc
+    from bluray_fidelity.matroska import _count_cue_points
+
+    mkv = tmp_path / "large_cues.mkv"
+    _write_mkv_with_large_cues(mkv, 5 * 1024 * 1024)
+    tracemalloc.start()
+    try:
+        assert _count_cue_points(mkv) == 1
+        _, peak = tracemalloc.get_traced_memory()
+    finally:
+        tracemalloc.stop()
+    assert peak < 512 * 1024
+
+
+def test_cues_smaller_than_four_mib_are_counted(tmp_path):
+    from bluray_fidelity.matroska import _count_cue_points
+
+    mkv = tmp_path / "small_large_cues.mkv"
+    _write_mkv_with_large_cues(mkv, 128 * 1024, payload_tail=b"\xbb\x80\xbb\x80")
+    assert _count_cue_points(mkv) == 2
+
+
+def test_cues_parser_handles_element_headers_split_across_chunks(tmp_path, monkeypatch):
+    import bluray_fidelity.matroska as matroska_mod
+
+    mkv = tmp_path / "split_headers.mkv"
+    _write_mkv_with_large_cues(mkv, 19, payload_tail=b"\xbb\x80\xbb\x80")
+    monkeypatch.setattr(matroska_mod, "_CUES_PARSE_CHUNK_BYTES", 1)
+    assert matroska_mod._count_cue_points(mkv) == 2
+
+
+def test_cues_parser_distinguishes_truncated_unknown_and_unparseable(tmp_path):
+    from bluray_fidelity.matroska import _count_cue_points
+
+    def write_cues(name, declared_size, payload):
+        path = tmp_path / name
+        path.write_bytes(
+            b"\x18\x53\x80\x67\x01" + b"\xff" * 7
+            + b"\x1c\x53\xbb\x6b" + declared_size + payload
+        )
+        return path
+
+    truncated = write_cues("truncated_cues.mkv", b"\x84", b"\xbb\x83\xb3")
+    with pytest.raises(ValueError, match="truncated"):
+        _count_cue_points(truncated)
+
+    unknown = write_cues("unknown_cuepoint.mkv", b"\x82", b"\xbb\xff")
+    with pytest.raises(ValueError, match="unknown_size"):
+        _count_cue_points(unknown)
+
+    malformed = write_cues("malformed_cues.mkv", b"\x81", b"\x00")
+    with pytest.raises(ValueError, match="parse_failed"):
+        _count_cue_points(malformed)
+
+    empty = write_cues("empty_cues.mkv", b"\x80", b"")
+    with pytest.raises(ValueError, match="parse_failed"):
+        _count_cue_points(empty)
+
+
+def test_cues_parse_failure_is_reported_as_non_absence_at_publish_gate(tmp_path):
+    from bluray_fidelity.matroska import (
+        MatroskaBuildError,
+        _verify_cues_and_seek,
+    )
+
+    output = tmp_path / "bad_cues.mkv"
+    output.write_bytes(b"\x18\x53\x80\x67\x01" + b"\xff" * 7
+                       + b"\x1c\x53\xbb\x6b\x82\xbb\xff")
+    diagnostics = {}
+    with pytest.raises(MatroskaBuildError, match="unknown_size"):
+        _verify_cues_and_seek("ffprobe", output, 100_000_000_000, diagnostics)
+    assert diagnostics["cues_status"] == "unknown_size"
+
+    absent = tmp_path / "no_cues.mkv"
+    absent.write_bytes(
+        b"\x18\x53\x80\x67\x87\x15\x49\xa9\x66\x82\x80\x80"
+    )
+    with pytest.raises(MatroskaBuildError, match="缺少结构化 Cues"):
+        _verify_cues_and_seek("ffprobe", absent, 100_000_000_000)
 
 
 def test_verify_seekable_three_outcomes(tmp_path, monkeypatch):
@@ -1077,7 +1327,7 @@ def test_cuepoint_count_ignores_nested_bb_bytes(tmp_path):
     # 顶层 CuePoint 只有 1 个；裸字节计数会得到 2。
     cues_payload = b"\xbb\x83" + b"\xb3\x81\xbb"
     segment = (
-        b"\x18\x53\x80\x67" + b"\x8b" +            # Segment size=11
+        b"\x18\x53\x80\x67" + b"\x8a" +            # Segment size=10
         b"\x1c\x53\xbb\x6b" + b"\x85" +            # Cues size=5
         cues_payload
     )
@@ -1110,39 +1360,41 @@ def test_real_small_mkv_cues_and_seek(tmp_path):
     builder._verify_seekable(real_mkv)  # 真实 ffprobe 命令实际执行
 
 
-def test_truncated_and_invalid_cuepoints_return_zero(tmp_path):
-    """round-4 P2：截断/越界/unknown CuePoint 一律按结构损坏返回 0。"""
+def test_truncated_and_invalid_cuepoints_report_structure_status(tmp_path):
+    """截断/越界/unknown CuePoint 一律作为显式结构错误报告。"""
     from bluray_fidelity.matroska import _count_cue_points
 
-    # 声明 size=10 但负载为 0（截断）→ 0。
+    # Cues 子元素声明负载但文件提前结束，状态必须是 truncated。
     truncated = (
-        b"\x18\x53\x80\x67" + b"\x8c" +
+        b"\x18\x53\x80\x67" + b"\x01" + b"\xff" * 7 +
         b"\x1c\x53\xbb\x6b" + b"\x84" +
         b"\xbb\x8a"
     )
     mkv = tmp_path / "truncated.mkv"
     mkv.write_bytes(truncated)
-    assert _count_cue_points(mkv) == 0
+    with pytest.raises(ValueError, match="truncated"):
+        _count_cue_points(mkv)
 
     # 只有 ID 无 size 字段（截断 header）→ 0。
     only_id = (
-        b"\x18\x53\x80\x67" + b"\x8b" +
-        b"\x1c\x53\xbb\x6b" + b"\x85" +
-        b"\xbb" + b"\x80" * 4
+        b"\x18\x53\x80\x67" + b"\x01" + b"\xff" * 7 +
+        b"\x1c\x53\xbb\x6b" + b"\x81" + b"\xbb"
     )
     mkv2 = tmp_path / "only_id.mkv"
     mkv2.write_bytes(only_id)
-    assert _count_cue_points(mkv2) == 0
+    with pytest.raises(ValueError, match="truncated"):
+        _count_cue_points(mkv2)
 
     # unknown-size CuePoint → 0。
     unknown_size = (
-        b"\x18\x53\x80\x67" + b"\x8c" +
+        b"\x18\x53\x80\x67" + b"\x01" + b"\xff" * 7 +
         b"\x1c\x53\xbb\x6b" + b"\x84" +
         b"\xbb\xff\x80\x80"
     )
     mkv3 = tmp_path / "unknown_size.mkv"
     mkv3.write_bytes(unknown_size)
-    assert _count_cue_points(mkv3) == 0
+    with pytest.raises(ValueError, match="unknown_size"):
+        _count_cue_points(mkv3)
 
 
 def test_real_180s_mkv_midpoint_seek(tmp_path):
@@ -1171,10 +1423,10 @@ def test_real_180s_mkv_midpoint_seek(tmp_path):
 
 # ============ BATCH-002 Gate A 回归 ============
 
-def _b2_streams(with_el: bool = False):
+def _b2_streams(with_el: bool = False, width: int = 3840):
     streams = [
         {"codec_type": "video", "codec_name": "hevc", "id": "0x1011",
-         "width": 3840, "height": 2160, "index": 0,
+         "width": width, "height": 2160, "index": 0,
          "avg_frame_rate": "24000/1001"},
         {"codec_type": "audio", "codec_name": "dts", "id": "0x1100",
          "index": 1},
@@ -1698,14 +1950,15 @@ def test_ffmpeg_dv_builder_cleans_temporaries_on_failure(tmp_path, monkeypatch):
 
 
 def test_batch002_peak_space_models(tmp_path):
-    """§7-9 非 DV 2×（主片+部分 MKV）、DV 5×（+BL/EL/合并视频/时间戳中转）。"""
+    """§7-9 非 DV 3×（物化主片 + 在写成品 + 槽位保留成品）、DV 5×
+    （+BL/EL/合并视频，覆盖各阶段共存峰值）。"""
     from bluray_fidelity.matroska import (
         FfmpegDvFileMatroskaBuilder,
         FfmpegFileMatroskaBuilder,
     )
 
     asset = _asset(tmp_path)  # size=10_000_000
-    assert FfmpegFileMatroskaBuilder().peak_space_bytes(asset) == 2 * 10_000_000 + 512 * 1024**2
+    assert FfmpegFileMatroskaBuilder().peak_space_bytes(asset) == 3 * 10_000_000 + 512 * 1024**2
     assert FfmpegDvFileMatroskaBuilder().peak_space_bytes(asset) == 5 * 10_000_000 + 512 * 1024**2
 
 
@@ -2288,10 +2541,11 @@ def test_gateb_video_timeline_rejects_wrong_video_duration(monkeypatch, tmp_path
 
 
 def test_gateb_seek_window_command_uses_time_not_packet_count(monkeypatch):
-    """P1-B：seek 时间窗口用 `start%+10`（秒），不再用 `+#30`/`+#300` 帧上限。"""
+    """P1-B：seek 时间窗口用秒；解码帧窗口从目标前一窗口启动。"""
     import bluray_fidelity.matroska as m
 
     intervals: list[str] = []
+    commands: list[list[str]] = []
 
     class FakeCompleted:
         def __init__(self, stdout):
@@ -2299,18 +2553,63 @@ def test_gateb_seek_window_command_uses_time_not_packet_count(monkeypatch):
 
     def fake_run(*args, **kwargs):
         cmd = args[0]
+        commands.append(cmd)
         intervals.append(cmd[cmd.index("-read_intervals") + 1])
         if "-of" in cmd and cmd[cmd.index("-of") + 1] == "json":
             return FakeCompleted('{"packets":[]}')
-        return FakeCompleted("")
+        return FakeCompleted("2657.0")
 
     monkeypatch.setattr(m.subprocess, "run", fake_run)
     m._probe_interval_packets("ffprobe", Path("/tmp/x.mkv"), 2657.0)
     m._probe_interval_frames("ffprobe", Path("/tmp/x.mkv"), 2657.0)
-    assert len(intervals) >= 2, "应至少捕获两个 read_intervals（packet + frame）"
+    assert len(intervals) == 2, "应捕获两个 read_intervals"
     for iv in intervals:
         assert "#" not in iv, f"不得使用 #N 帧上限：{iv!r}"
-        assert "%" in iv, f"应为时间窗口：{iv!r}"
+    assert intervals[0].startswith("2657.000%+"), f"packet 应从目标开始：{intervals[0]!r}"
+    assert intervals[1].startswith("2647.000%+"), f"frame 应从目标前窗口开始：{intervals[1]!r}"
+    assert "-skip_frame" in commands[1] and commands[1][commands[1].index("-skip_frame") + 1] == "nokey"
+
+
+def test_gateb_seek_frame_retries_without_keyframe_filter(monkeypatch):
+    """没有 nokey 解码帧时，限定窗口内回退普通 frame 探测。"""
+    import bluray_fidelity.matroska as m
+
+    commands: list[list[str]] = []
+
+    class FakeCompleted:
+        def __init__(self, stdout):
+            self.stdout = stdout
+            self.stderr = ""
+            self.returncode = 0
+
+    def fake_run(*args, **kwargs):
+        cmd = args[0]
+        commands.append(cmd)
+        return FakeCompleted("" if "-skip_frame" in cmd else "2647.0")
+
+    monkeypatch.setattr(m.subprocess, "run", fake_run)
+    frames = m._probe_interval_frames("ffprobe", Path("/tmp/x.mkv"), 2657.0)
+    assert frames == [2647.0]
+    assert len(commands) == 2
+    assert "-skip_frame" not in commands[1]
+
+
+def test_gateb_seek_frames_accept_csv_side_data(monkeypatch):
+    """HDR frame side-data is appended after the CSV timestamp."""
+    import bluray_fidelity.matroska as m
+
+    class FakeCompleted:
+        returncode = 0
+        stderr = ""
+        stdout = (
+            "786.486000\n"
+            "786.527700,Mastering display metadata,35400/50000\n"
+            "786.569400,Content light level metadata,997,634\n"
+        )
+
+    monkeypatch.setattr(m.subprocess, "run", lambda *a, **k: FakeCompleted())
+    frames = m._probe_interval_frames("ffprobe", Path("/tmp/x.mkv"), 786.5)
+    assert frames == [786.486, 786.5277, 786.5694]
 
 
 def test_gateb_dv_evidence_fail_closed_when_el_evidence_missing(monkeypatch, tmp_path):
@@ -2458,6 +2757,28 @@ def test_gateb_seek_failure_diagnostics_json(tmp_path, monkeypatch):
         # 命令/rc/stderr 由真实探测 helper 写入（mock 路径不覆盖）；
         # 至少保证失败点结构与已完成点证据保留。
         assert points[0].get("target_seconds") is not None
+
+
+def test_gateb_seek_widens_decoder_window_before_rejecting(monkeypatch, tmp_path):
+    import bluray_fidelity.matroska as m
+
+    out = tmp_path / "out.mkv"
+    out.write_bytes(b"x")
+    monkeypatch.setattr(m, "_count_cue_points", lambda _p: 3)
+    monkeypatch.setattr(
+        m, "_probe_interval_packets",
+        lambda *a, **k: [{"pts_time": "10.0", "flags": "K"}],
+    )
+    calls = []
+
+    def probe_frames(*args, **kwargs):
+        calls.append(kwargs.get("lookback_seconds"))
+        return [] if len(calls) % 2 == 1 else [float(args[2])]
+
+    monkeypatch.setattr(m, "_probe_interval_frames", probe_frames)
+    result = m._verify_cues_and_seek("ffprobe", out, int(100 * 1e9))
+    assert len(result["cues"]) == 3
+    assert calls[:2] == [None, m._SEEK_FALLBACK_LOOKBACK_SECONDS]
 
 
 def test_gateb_video_rate_conflict_fails_closed():
@@ -3871,3 +4192,1865 @@ def test_dv_round21_ceil_off_by_one():
     assert m._dv_coverage_required_frames(24.0, 90.0, 90.5) == 14
     # 纯整秒但不含起始帧样本：最小 2
     assert m._dv_coverage_required_frames(24.0, 90.0, 90.0) == max(2, 2)  # ceil(0)+2=2
+
+
+# ---------------------------------------------------------------------------
+# 2026-09-14 生产四个封装故障的回归（P1 探测超时误报媒体缺陷、P1 头部原因被
+# 尾部截断丢弃、P2 轨数量不一致缺诊断、P2 多段合辑静默选片）。
+# ---------------------------------------------------------------------------
+
+
+def test_probe_timeout_is_transient_and_decodes_bytes_detail(monkeypatch):
+    """P1：探测超时按瞬时（Transient）分类并说明超时秒数，绝不表述为媒体
+    缺陷；TimeoutExpired 在 text=True 下 stderr 仍是 bytes，详情必须解码。"""
+    import bluray_fidelity.matroska as m
+    from bluray_fidelity.matroska import TransientMatroskaBuildError
+
+    def fake_run(cmd, **kwargs):
+        raise m.subprocess.TimeoutExpired(
+            cmd, 300, stderr=b"CSV,hdr-metadata\nffprobe: read timed out\n",
+        )
+
+    monkeypatch.setattr(m.subprocess, "run", fake_run)
+    diag: dict = {}
+    with pytest.raises(TransientMatroskaBuildError) as frame_error:
+        m._probe_interval_frames("ffprobe", Path("/tmp/x.mkv"), 2657.0, diag=diag)
+    text = str(frame_error.value)
+    assert "超时" in text and "300" in text
+    assert "b'" not in text, "bytes 详情必须解码为文本"
+    assert "探测失败" not in text and "拒绝发布" not in text, "超时不得表述为媒体缺陷"
+    assert diag["frame_stderr"] == "CSV,hdr-metadata\nffprobe: read timed out"
+
+    with pytest.raises(TransientMatroskaBuildError, match="超时"):
+        m._probe_interval_packets("ffprobe", Path("/tmp/x.mkv"), 2657.0)
+    with pytest.raises(TransientMatroskaBuildError, match="时长探测超时"):
+        m._probe_duration("ffprobe", Path("/tmp/x.mkv"))
+
+
+def test_probe_failure_detail_keeps_reason_head(monkeypatch):
+    """P2：失败详情截断保留头部原因并标记省略号；原实现取尾部 300 字符，
+    800 字符的 ffprobe CSV 转储会把人工前缀整段挤掉。"""
+    import subprocess as _sp
+    import bluray_fidelity.matroska as m
+
+    dump = "CSV," * 200  # 800 字符工具转储
+
+    def fake_run(cmd, **kwargs):
+        raise _sp.CalledProcessError(1, cmd, output="", stderr=dump)
+
+    monkeypatch.setattr(m.subprocess, "run", fake_run)
+    with pytest.raises(MatroskaBuildError) as error:
+        m._probe_interval_frames("ffprobe", Path("/tmp/x.mkv"), 100.0)
+    text = str(error.value)
+    assert text.startswith("成品 seek frame 探测失败：")
+    assert text.endswith("…")
+    assert len(text) <= m._DETAIL_LIMIT + len("成品 seek frame 探测失败：")
+    assert m._bounded_detail(dump) == dump[: m._DETAIL_LIMIT - 1] + "…"
+
+
+def test_mismatch_reports_observed_and_mapped_track_ids(tmp_path):
+    """P2：数量不一致消息必须同时给出成品轨与可映射 MPLS 轨标识（有界），
+    无 mkvmerge 命令日志时也能重建差异。"""
+    from bluray_fidelity.matroska import validate_finalized_identification
+
+    asset = _asset(tmp_path)
+    resolved = resolve_official_tracks(asset, parse_identification(_input_identification()))
+    output = {
+        "container": {"properties": {"duration": 100_000_000_000}},
+        "tracks": [
+            {"id": 0, "type": "video", "codec": "HEVC/H.265/MPEG-H",
+             "properties": {}},
+            {"id": 1, "type": "audio", "codec": "TrueHD",
+             "properties": {"language": "eng", "stream_id": 4352}},
+            {"id": 2, "type": "subtitles", "codec": "HDMV PGS",
+             "properties": {"language": "eng"}},
+            {"id": 3, "type": "subtitles", "codec": "HDMV PGS",
+             "properties": {"language": "zho"}},
+        ],
+    }
+    with pytest.raises(MatroskaBuildError, match="音轨数量") as error:
+        validate_finalized_identification(asset, resolved, output)
+    text = str(error.value)
+    assert "成品 1 条" in text and "可映射 2 条" in text
+    assert "id=1/pid=0x1100/TrueHD/eng" in text
+    assert "official=0/pid=0x1100→id=2" in text
+    assert "official=1/pid=0x1101→id=4" in text
+
+    # 字幕数量不一致：音轨数量对齐（2 条）后同样带两边的标识。
+    mismatched_subtitles = {
+        "container": output["container"],
+        "tracks": [
+            {"id": 0, "type": "video", "codec": "HEVC/H.265/MPEG-H",
+             "properties": {}},
+            {"id": 1, "type": "audio", "codec": "TrueHD",
+             "properties": {"language": "eng"}},
+            {"id": 2, "type": "audio", "codec": "AC-3",
+             "properties": {"language": "zho"}},
+            {"id": 3, "type": "subtitles", "codec": "HDMV PGS",
+             "properties": {"language": "eng", "stream_id": 4768}},
+        ],
+    }
+    with pytest.raises(MatroskaBuildError, match="字幕数量") as subtitle_error:
+        validate_finalized_identification(asset, resolved, mismatched_subtitles)
+    subtitle_text = str(subtitle_error.value)
+    assert "成品 1 条" in subtitle_text and "可映射 2 条" in subtitle_text
+    assert "id=3/pid=0x12a0/HDMV PGS/eng" in subtitle_text
+    assert "official=0/pid=0x12a0→id=5" in subtitle_text
+
+
+# ---------------------------------------------------------------------------
+# 多段合辑（连放/无缝分支）：按 play item 逐段物化 + mkvmerge 追加
+# （2026-09-14 生产缺陷：字节拼接的时间轴与 MPLS 期望不重叠，seek 门失败）
+# ---------------------------------------------------------------------------
+
+# 3 段合辑的分段字节数（和 = asset.size，与 reader 的"区间总长=标题大小"一致）。
+_MULTICLIP_BOUNDS = ((0, 30), (30, 20), (50, 10))
+
+
+def _multiclip_asset(tmp_path: Path) -> BlurayTitleAsset:
+    """3 段连放：clip 00001 被引用两次（#0/#2），00002 一次（#1）。"""
+    return replace(
+        _asset(tmp_path),
+        size=60,
+        clip_count=3,
+        duration_90k=81_000_000,
+        clips=(
+            BlurayClip(index=0, clip_id="00001", in_time=54_000_000, out_time=81_000_000),
+            BlurayClip(index=1, clip_id="00002", in_time=0, out_time=27_000_000),
+            BlurayClip(index=2, clip_id="00001", in_time=54_000_000, out_time=81_000_000),
+        ),
+    )
+
+
+def _install_multiclip_reader(monkeypatch, bounds=_MULTICLIP_BOUNDS):
+    """假 reader：边界给定，逐段字节 = bytes([item+1]) * 该段长度。返回读取序号。"""
+    import bluray_fidelity.matroska as m
+
+    read_items: list[int] = []
+    monkeypatch.setattr(m, "bluray_item_bounds", lambda _asset: tuple(bounds))
+
+    def fake_iter(_asset, item_index, chunk_size=1 << 20):
+        read_items.append(item_index)
+        remaining = bounds[item_index][1]
+        while remaining:
+            size = min(chunk_size, remaining)
+            yield bytes([item_index + 1]) * size
+            remaining -= size
+
+    monkeypatch.setattr(m, "iter_bluray_item", fake_iter)
+    return read_items
+
+
+def _run_multiclip_build(monkeypatch, tmp_path, *, asset=None,
+                         bounds=_MULTICLIP_BOUNDS, payloads=None, streams=None,
+                         hdr10plus=None, capture=None, output_name="final.mkv.partial"):
+    """走真实 MatroskaBuilder.build（reader/识别/探测/封装全假）。
+
+    ``capture`` 在 build 前就写入 commands/read_items/output，失败路径的断言
+    也能看到"封装命令从未发出""哪些段被物化过"。
+    """
+    import json
+    import bluray_fidelity.matroska as m
+    from bluray_fidelity.matroska import MatroskaBuilder
+
+    asset = asset if asset is not None else _multiclip_asset(tmp_path)
+    payloads = payloads or {}
+    capture = capture if capture is not None else {}
+    read_items = _install_multiclip_reader(monkeypatch, bounds)
+    commands: list[list[str]] = []
+    output = tmp_path / output_name
+    capture.update({"commands": commands, "read_items": read_items,
+                    "output": output, "asset": asset})
+
+    class FakeProcess:
+        stdout = iter(())
+
+        def wait(self):
+            return 0
+
+    class FakeCompleted:
+        stdout = json.dumps(_input_identification())
+
+    builder = MatroskaBuilder()
+    monkeypatch.setattr(m.shutil, "which", lambda _name: "/usr/bin/mkvmerge")
+    monkeypatch.setattr(
+        builder, "_identify_path",
+        lambda source: payloads.get(Path(source).name, _input_identification()),
+    )
+    monkeypatch.setattr(
+        builder, "_video_streams",
+        lambda source: streams(source) if callable(streams) else (streams or _b2_streams()),
+    )
+    monkeypatch.setattr(
+        builder, "_has_hdr10plus",
+        lambda source: bool(hdr10plus(Path(source))) if hdr10plus else False,
+    )
+    monkeypatch.setattr(m, "validate_finalized_identification", lambda *a, **k: {})
+    # E1 轨覆盖门对**真实成品**逐窗口测量在场区间，本装置的分段与成品都是桩字节
+    # （无任何媒体包），覆盖门在这里没有可驱动的对象；按本文件既有约定与识别门、
+    # 拼接门一并注入。覆盖门自身的真实媒体证据见 tests/test_matroska_track_coverage.py。
+    monkeypatch.setattr(m, "require_track_coverage", lambda *a, **k: {})
+    # DV 源侧字幕包证明要求真实段级 MKV；本测试构建的是桩字节，真实探针覆盖
+    # 在 test_matroska_track_coverage.py 中单独验证。
+    monkeypatch.setattr(
+        m, "_probe_source_subtitle_evidence",
+        lambda _probe, _segments, windows: m.SourceSubtitleEvidence({}, tuple(
+            frozenset() for _ in windows)),
+    )
+    monkeypatch.setattr(MatroskaBuilder, "_verify_multiclip_seams", lambda *a, **k: None)
+
+    def fake_popen(command, *args, **kwargs):
+        commands.append(list(command))
+        return FakeProcess()
+
+    monkeypatch.setattr(m.subprocess, "Popen", fake_popen)
+    monkeypatch.setattr(m.subprocess, "run", lambda *a, **k: FakeCompleted())
+    capture["result"] = builder.build(asset, output, title="合辑")
+    return capture
+
+
+def test_default_route_logs_mkvmerge_command_and_multiclip(
+    tmp_path, monkeypatch, caplog,
+):
+    """P2 + 2026-09-14 修复：默认 mkvmerge 路线必须先记录命令与选定轨 ID；
+    多段合辑按 play item 逐段物化，再用 `+` 追加（不做字节拼接）。"""
+    with caplog.at_level("INFO", logger="hdathome.matroska"):
+        capture = _run_multiclip_build(monkeypatch, tmp_path)
+
+    assert set(capture["result"]) == {"track_coverage"}, (
+        "良好路径只应带常驻的轨覆盖证据，不产生别的构建结果事实")
+    output = capture["output"]
+    segments = [output.with_name(f"{output.name}.item{index}.m2ts") for index in range(3)]
+    # 同一 clip 被引用两次 → 两个独立分段文件（按 play item 各自取区间，不去重）。
+    assert capture["asset"].clips[0].clip_id == capture["asset"].clips[2].clip_id
+    assert [path.stat().st_size for path in segments] == [30, 20, 10]
+    assert segments[0].read_bytes() == b"\x01" * 30
+    assert segments[2].read_bytes() == b"\x03" * 10
+    assert capture["read_items"] == [0, 1, 2]
+
+    (command,) = capture["commands"]
+    assert command.count("+") == 2
+    # 输入顺序 = MPLS 顺序（首段 + 两个追加段），无字节拼接。
+    assert [token for token in command if token.endswith(".m2ts")] == [
+        str(path) for path in segments
+    ]
+    assert command.index("+") > command.index(str(segments[0]))
+    # 2026-09-16 修正（生产标本 dlv_93c13946d7c0eac7c0b9）：逐文件轨编号选项
+    # **只对紧随其后的那个输入生效**，所以每个追加段都必须**重复同一组逐轨选择**
+    # ——否则追加段会复制它自己的全部轨，与首段的排除集不一致，mkvmerge 的默认
+    # 按位映射随即指向首段未复制的轨（`… does not contain a track with the ID 3 …
+    # --append-to was invalid`，1.3 秒报错退出、交付永远无法完成）。
+    # 旧做法（追加段只给类型级开关）在**子集段**上确实不能复用首段轨编号，但子集段
+    # 现在根本不进封装（_prepare_items 记违规 → _trailing_exclusions 尾部排除、
+    # 中段违规失败关闭），故此处复用首段轨 ID 不会引用不存在的轨。
+    assert command.count("--audio-tracks") == 3
+    assert command.count("--subtitle-tracks") == 3
+    assert command.count("--video-tracks") == 3
+    # 显式追加映射：覆盖每个追加段的**每一条被复制轨**，且不引用被排除的 track 3。
+    # 2026-09-17 修正：目标文件号是**前一段**（file N → file N-1），不是首段 0。
+    # 旧实现硬编码 0，两段时恰好正确，3 段时 `2:x:0:x` 与 `1:x:0:x` 冲突 →
+    # mkvmerge 退出码 2（错误）、不产出文件（生产标本 dlv_b3532c0cbbbe66742be8）。
+    mapping = command[command.index("--append-to") + 1]
+    for offset in (1, 2):
+        for track_id in (0, 1, 2, 4, 5, 6):
+            assert f"{offset}:{track_id}:{offset - 1}:{track_id}" in mapping
+    assert "1:3:0:3" not in mapping and "2:3:0:3" not in mapping
+    # 绝不把多个源文件映射到同一条目标轨（mkvmerge 会以错误中止）。
+    assert "2:0:0:0" not in mapping and "2:1:0:1" not in mapping
+    # 全局选项必须出现在输入之前（mkvmerge 按位置解析选项）。
+    assert command.index("--append-to") < command.index(str(segments[0]))
+    assert "--gui-mode" in command
+
+    text = "\n".join(
+        record.getMessage() for record in caplog.records
+        if record.name == "hdathome.matroska"
+    )
+    assert "mkvmerge 命令：" in text
+    assert "--audio-tracks 2,4" in text
+    assert "--subtitle-tracks 5,6" in text
+    assert "video=0,1 audio=2,4 subtitle=5,6" in text
+    assert "多段合辑主片" in text
+    assert "#0 00001 in=600.0s out=900.0s" in text
+    # 单文件 source 不参与多段路线，也不得残留。
+    assert not output.with_name(output.name + ".source.m2ts").exists()
+
+
+def test_single_clip_route_keeps_one_input_without_append(tmp_path, monkeypatch):
+    """单段标题（99% 库）保持既有单文件路线：不探测 play item 边界、命令无
+    `+`、只有一个输入、不产生任何分段文件。"""
+    import json
+    import bluray_fidelity.matroska as m
+    from bluray_fidelity.matroska import MatroskaBuilder
+
+    asset = _asset(tmp_path)
+    assert m.planned_segment_count(asset) == 0
+
+    def forbidden_bounds(_asset):
+        raise AssertionError("单段标题不得探测 MPLS play item 边界")
+
+    monkeypatch.setattr(m, "bluray_item_bounds", forbidden_bounds)
+    monkeypatch.setattr(m, "iter_bluray_item",
+                        lambda *a, **k: (_ for _ in ()).throw(
+                            AssertionError("单段标题不得按 play item 读取")))
+
+    materialized: list[Path] = []
+
+    def fake_materialize(_asset, source, progress=None, staging=None):
+        materialized.append(Path(source))
+        source.parent.mkdir(parents=True, exist_ok=True)
+        source.write_bytes(b"m" * int(_asset.size))
+
+    monkeypatch.setattr(MatroskaBuilder, "_materialize_title", staticmethod(fake_materialize))
+    commands: list[list[str]] = []
+
+    class FakeProcess:
+        stdout = iter(())
+
+        def wait(self):
+            return 0
+
+    class FakeCompleted:
+        stdout = json.dumps(_input_identification())
+
+    monkeypatch.setattr(m.shutil, "which", lambda _name: "/usr/bin/mkvmerge")
+    monkeypatch.setattr(m.subprocess, "Popen",
+                        lambda command, *a, **k: (commands.append(list(command)), FakeProcess())[1])
+    monkeypatch.setattr(m.subprocess, "run", lambda *a, **k: FakeCompleted())
+    monkeypatch.setattr(m, "validate_finalized_identification", lambda *a, **k: {})
+    monkeypatch.setattr(m, "require_track_coverage", lambda *a, **k: {})
+    seekable: list = []
+    monkeypatch.setattr(MatroskaBuilder, "_verify_seekable",
+                        lambda self, path, dv_facts=None, **kw: seekable.append(dv_facts))
+    builder = MatroskaBuilder()
+    monkeypatch.setattr(builder, "_video_streams", lambda _source: [])
+    monkeypatch.setattr(builder, "_has_hdr10plus", lambda _source: False)
+
+    output = tmp_path / "final.mkv.partial"
+    # 构建结果现在恒带轨覆盖证据（E1）；除此之外本路径不得产生别的事实。
+    assert set(builder.build(asset, output, title="单片")) == {"track_coverage"}
+    assert materialized == [output.with_name(output.name + ".source.m2ts")]
+    (command,) = commands
+    assert "+" not in command
+    assert [token for token in command if token.endswith(".m2ts")] == [str(materialized[0])]
+    assert not list(output.parent.glob("*.item*.m2ts"))
+    assert seekable == [None]
+
+
+def test_multiclip_checkpoint_reuses_complete_and_restarts_truncated(tmp_path, monkeypatch):
+    """分段检查点按段校验：完整段复用，截断段删除后重新物化（绝不续用）。"""
+    from bluray_fidelity.matroska import build_artifacts
+
+    asset = _multiclip_asset(tmp_path)
+    artifacts = build_artifacts(tmp_path / "final.mkv.partial", segment_count=3)
+    artifacts.segments[0].write_bytes(b"A" * 30)      # 完整 → 复用
+    artifacts.segments[1].write_bytes(b"truncated")   # 截断 → 丢弃重做
+
+    capture = _run_multiclip_build(monkeypatch, tmp_path, asset=asset)
+    assert capture["read_items"] == [1, 2]
+    assert artifacts.segments[0].read_bytes() == b"A" * 30
+    assert [path.read_bytes() for path in artifacts.segments[1:]] == [
+        b"\x02" * 20, b"\x03" * 10,
+    ]
+
+
+def test_multiclip_build_fails_closed_when_a_segment_track_disagrees(tmp_path, monkeypatch):
+    """逐段核对在追加前执行：后段**新增**一条字幕轨即失败关闭，封装命令从未发出。
+
+    （纯子集缺失不在此列：母盘终段少声明轨属真实结构，需放行并记录事实，
+    见 test_multiclip_subset_difference_proceeds_and_records_fact。）
+    """
+    import bluray_fidelity.matroska as m
+
+    asset = _multiclip_asset(tmp_path)
+    output = tmp_path / "final.mkv.partial"
+    broken = _input_identification()
+    broken["tracks"] = [
+        *broken["tracks"],
+        {"id": 7, "type": "subtitles", "codec": "HDMV PGS",
+         "properties": {"stream_id": 4770}},
+    ]
+    capture: dict = {}
+    with pytest.raises(m.MatroskaBuildError, match="第 2/3 段") as error:
+        _run_multiclip_build(
+            monkeypatch, tmp_path, asset=asset, capture=capture,
+            payloads={f"{output.name}.item1.m2ts": broken},
+        )
+    assert "新增 subtitles/pid=0x12a2" in str(error.value)
+    assert capture["commands"] == []
+    # 2026-09-15：逐段核对不再"遇到违规立刻停"——违规段能否按**尾部**排除
+    # 要等全部段核对完（越南战争：尾部 11.4s logo 与首段同 PID 不同声道数，
+    # 只能显式排除；中段违规仍必须失败关闭）。因此全部段都被物化/识别，
+    # 但封装命令仍未发出（capture["commands"] == [] 才是"追加前失败闭合"的证据）。
+    assert capture["read_items"] == [0, 1, 2]
+
+
+def test_multiclip_trailing_incompatible_segment_is_excluded_with_facts(
+    tmp_path, monkeypatch, caplog,
+):
+    """尾部轨道不兼容段显式排除（不并入成品、不静默），中段不兼容仍失败关闭。
+
+    2026-09-15 越南战争（S01E09 盘）生产实证：主片 playlist 19 段里 item 0..16 是
+    两集正片（同一 clip 连续覆盖），item 17 是 173s 预告（轨道为首段的纯子集，按事实
+    放行），item 18 是 11.4s 碟内 logo——与首段**同 PID 不同声道数**（0x1100 首段
+    6ch、本段 2ch）。mkvmerge 追加只能映射到首文件已存在的目标轨，目标轨属性由首段
+    决定，并入即坏音；显式排除并留痕，否则该标题永远不可交付（同 2026-09-14 对
+    「终段少声明字幕 PID」的裁定精神）。
+    """
+    import bluray_fidelity.matroska as m
+
+    asset = _multiclip_asset(tmp_path)   # 3 段
+    output = tmp_path / "final.mkv.partial"
+    # 末段（item2）：与首段同 PID 但声道数不同（漂移，不是纯子集）
+    drifted = _input_identification()
+    for track in drifted["tracks"]:
+        if track["id"] == 0:  # 主音轨（与首段同 stream_id）
+            track["properties"]["audio_channels"] = 2
+    capture: dict = {}
+    with caplog.at_level("WARNING", logger="hdathome.matroska"):
+        _run_multiclip_build(
+            monkeypatch, tmp_path, asset=asset, capture=capture,
+            payloads={f"{output.name}.item2.m2ts": drifted},
+        )
+
+    # 成品的追加输入不含被排除的末段（首段 + 仅 item1）
+    (command,) = capture["commands"]
+    segments = [output.with_name(f"{output.name}.item{index}.m2ts")
+                for index in range(3)]
+    assert [token for token in command if token.endswith(".m2ts")] == [
+        str(segments[0]), str(segments[1]),
+    ]
+    assert command.count("+") == 1
+    text = "\n".join(record.getMessage() for record in caplog.records
+                     if record.name == "hdathome.matroska")
+    assert "已显式排除" in text
+    assert "item 3/3" in text          # 逐段事实：段号 + clip + 区间 + 差异原因
+    assert "audio_channels" in text or "≠本段" in text
+
+
+def test_multiclip_mid_feature_incompatible_segment_still_fails_closed(
+    tmp_path, monkeypatch,
+):
+    """中段不兼容**不可**按尾部排除：跳过中段等于成品连续性被破坏（内容损坏）。
+
+    判据：违规段之后仍有与首段对应的段 → 失败关闭，封装命令从未发出。
+    """
+    import bluray_fidelity.matroska as m
+
+    asset = _multiclip_asset(tmp_path)   # 3 段，末段与首段同 clip（对应）
+    output = tmp_path / "final.mkv.partial"
+    drifted = _input_identification()
+    for track in drifted["tracks"]:
+        if track["id"] == 2:           # 次音轨：8ch 漂移
+            track["properties"]["audio_channels"] = 8
+    capture: dict = {}
+    with pytest.raises(m.MatroskaBuildError, match="无法按尾部排除"):
+        _run_multiclip_build(
+            monkeypatch, tmp_path, asset=asset, capture=capture,
+            payloads={f"{output.name}.item1.m2ts": drifted},
+        )
+    assert capture["commands"] == []
+
+
+def test_trim_command_maps_every_stream_and_cuts_at_nominal_duration(
+    tmp_path, monkeypatch,
+):
+    """裁切命令必须 -map 0（否则 ffmpeg 只留每类一条流，音轨/字幕被丢）。
+
+    2026-09-15 越南战争：漏 -map 0 的裁切产物缺 PGS/多余音轨 → mkvmerge 报
+    "A track with the ID 5 was requested but not found" 且 --append-to invalid 终止。
+    """
+    import bluray_fidelity.matroska as m
+    from bluray_fidelity.matroska import MatroskaBuilder
+
+    captured: list[list[str]] = []
+
+    class FakeCompleted:
+        returncode = 0
+        stdout = ""
+        stderr = ""
+
+    def fake_run(command, *args, **kwargs):
+        captured.append(list(command))
+        pathlib.Path(command[-1]).write_bytes(b"trimmed")
+        return FakeCompleted()
+
+    builder = MatroskaBuilder()
+    monkeypatch.setattr(m.subprocess, "run", fake_run)
+    segment = tmp_path / "seg.m2ts"
+    segment.write_bytes(b"x")
+    staging = tmp_path / "seg.staging"
+    trimmed = builder._trim_segment(segment, 600.0, 539.839, staging)
+
+    assert trimmed is not None and trimmed.exists()
+    (command,) = captured
+    assert command[command.index("-map") + 1] == "0"
+    assert command[command.index("-t") + 1] == "539.839"
+    assert "-c" in command and command[command.index("-c") + 1] == "copy"
+    # 承载容器必须是 mpegts：matroska 承载时 ffmpeg 不写时长元数据，mkvmerge
+    # 汇总出的成品会被管线成品门判「缺少有效时长/Cues 信息」（越南战争实证）。
+    assert command[command.index("-f") + 1] == "mpegts"
+    # 不加 -copyts：-t 以输出时间轴为准，保留素材内时间戳时会把整段裁空（实测 0 字节）
+    assert "-copyts" not in command
+    assert command[-1].endswith(".trimmed.ts")
+    assert str(segment) in command
+
+
+def test_multiclip_tail_overhang_is_measured_not_trimmed(tmp_path, monkeypatch, caplog):
+    """末端溢出**只测量、不裁切**，并计入拼接门的时长期望。
+
+    2026-09-15 真盘实测：裁切（matroska/TS 承载都一样）会让 mkvmerge 对追加成品
+    **无法确定容器时长**（成品门判「缺少有效时长/Cues 信息」）；而 17 段原始分段
+    追加一切正常（rc=0、时长 6574.81s 双工具一致）。溢出的成因是母盘切点落在 PGS
+    显示集内部（结构事实），因此：封装用原始分段，期望时长 = Σ 段时长 + 实测溢出。
+    """
+    import bluray_fidelity.matroska as m
+    from bluray_fidelity.matroska import MatroskaBuilder
+
+    trims: list = []
+    monkeypatch.setattr(MatroskaBuilder, "_segment_first_timestamp",
+                        lambda self, _segment: 600.0)
+    monkeypatch.setattr(MatroskaBuilder, "_segment_tail_overhang",
+                        lambda self, _segment, _first, _duration: 0.42)
+    monkeypatch.setattr(MatroskaBuilder, "_trim_segment",
+                        lambda self, *a, **k: trims.append(a) or None)
+    with caplog.at_level("WARNING", logger="hdathome.matroska"):
+        capture = _run_multiclip_build(monkeypatch, tmp_path)
+
+    # 不再裁切
+    assert trims == []
+    (command,) = capture["commands"]
+    inputs = [token for token in command if token.endswith(".m2ts")]
+    assert len(inputs) == 3 and all(".trimmed" not in token for token in inputs)
+    # 溢出作为事实留痕
+    assert "末端溢出" in caplog.text and "计入时长期望" in caplog.text
+    # 溢出合计随构建结果留痕（拼接门期望 = Σ 段时长 + 该合计）
+    variances = capture["result"].get("segment_track_variances") or []
+    assert variances and all("末端溢出" in item for item in variances)
+
+
+def test_trim_command_maps_every_stream_and_cuts_at_nominal_duration(
+    tmp_path, monkeypatch,
+):
+    """裁切命令必须 -map 0（否则 ffmpeg 只留每类一条流，音轨/字幕被丢）。
+
+    2026-09-15 越南战争：漏 -map 0 的裁切产物缺 PGS/多余音轨 → mkvmerge 报
+    "A track with the ID 5 was requested but not found" 且 --append-to invalid 终止。
+    """
+    import bluray_fidelity.matroska as m
+    from bluray_fidelity.matroska import MatroskaBuilder
+
+    captured: list[list[str]] = []
+
+    class FakeCompleted:
+        returncode = 0
+        stdout = ""
+        stderr = ""
+
+    def fake_run(command, *args, **kwargs):
+        captured.append(list(command))
+        pathlib.Path(command[-1]).write_bytes(b"trimmed")
+        return FakeCompleted()
+
+    builder = MatroskaBuilder()
+    monkeypatch.setattr(m.subprocess, "run", fake_run)
+    segment = tmp_path / "seg.m2ts"
+    segment.write_bytes(b"x")
+    staging = tmp_path / "seg.staging"
+    trimmed = builder._trim_segment(segment, 600.0, 539.839, staging)
+
+    assert trimmed is not None and trimmed.exists()
+    (command,) = captured
+    assert command[command.index("-map") + 1] == "0"
+    assert command[command.index("-t") + 1] == "539.839"
+    assert "-c" in command and command[command.index("-c") + 1] == "copy"
+    # 承载容器必须是 mpegts：matroska 承载时 ffmpeg 不写时长元数据，mkvmerge
+    # 汇总出的成品会被管线成品门判「缺少有效时长/Cues 信息」（越南战争实证）。
+    assert command[command.index("-f") + 1] == "mpegts"
+    # 不加 -copyts：-t 以输出时间轴为准，保留素材内时间戳时会把整段裁空（实测 0 字节）
+    assert "-copyts" not in command
+    assert command[-1].endswith(".trimmed.ts")
+    assert str(segment) in command
+
+
+def test_segment_subset_must_be_per_type_prefix():
+    """纯子集放行的**唯一安全形态**：每类轨序列都是首段同类序列的前缀。
+
+    2026-09-15：追加段的逐文件轨编号选项不能跨文件复用，mkvmerge 按类型+顺序
+    把追加段续接到首段同类轨；中段少一条会让其后的同类轨整体前移（静默错接），
+    因此只有"末尾少声明"才放行（越南战争尾段预告少 2 条 PGS → 前缀 ✓ 放行；
+    若少的是中间那条 → 失败关闭）。
+    """
+    import copy
+    import bluray_fidelity.matroska as m
+
+    payload = copy.deepcopy(_input_identification())
+    first = m._segment_track_facts(payload)
+
+    # 末尾少声明：删除最后一条音频轨 → 前缀，放行并给出子集事实
+    trailing = copy.deepcopy(payload)
+    audio_ids = [track["id"] for track in trailing["tracks"] if track["type"] == "audio"]
+    trailing["tracks"] = [
+        track for track in trailing["tracks"] if track["id"] != audio_ids[-1]
+    ]
+    subset = m.require_segment_track_correspondence(
+        first, m._segment_track_facts(trailing), label="第 2/3 段（play item 1）")
+    assert subset is not None
+    assert [key[1] for key in subset.missing] == [
+        [track for track in payload["tracks"] if track["id"] == audio_ids[-1]][0]
+        ["properties"]["stream_id"]
+    ]
+
+    # 中段少声明：删除第一条音频轨（其后同类轨会整体前移）→ 失败关闭
+    middle = copy.deepcopy(payload)
+    middle["tracks"] = [
+        track for track in middle["tracks"] if track["id"] != audio_ids[0]
+    ]
+    with pytest.raises(m.MatroskaBuildError):
+        m.require_segment_track_correspondence(
+            first, m._segment_track_facts(middle), label="第 2/3 段（play item 1）")
+
+
+def test_segment_track_correspondence_rejects_added_and_mismatched():
+    """追加前必须逐项核对：增轨、事实漂移仍然失败关闭并带差异事实。"""
+    import copy
+    import bluray_fidelity.matroska as m
+
+    payload = copy.deepcopy(_input_identification())
+    payload["tracks"][2]["properties"]["audio_channels"] = 8
+    payload["tracks"][3]["properties"]["audio_channels"] = 2
+    payload["tracks"][4]["properties"]["audio_channels"] = 2
+    first = m._segment_track_facts(payload)
+
+    added = copy.deepcopy(payload)
+    added["tracks"].append({"id": 7, "type": "subtitles", "codec": "HDMV PGS",
+                            "properties": {"stream_id": 4770}})
+    with pytest.raises(m.MatroskaBuildError, match="新增 subtitles/pid=0x12a2"):
+        m.require_segment_track_correspondence(
+            first, m._segment_track_facts(added), label="第 2/3 段（play item 1）")
+
+    changed = copy.deepcopy(payload)
+    changed["tracks"][4]["properties"]["audio_channels"] = 6
+    with pytest.raises(m.MatroskaBuildError, match="不一致") as error:
+        m.require_segment_track_correspondence(
+            first, m._segment_track_facts(changed), label="第 2/3 段（play item 1）")
+    text = str(error.value)
+    assert "audio/pid=0x1101" in text and "audio_channels=6" in text
+
+    language = copy.deepcopy(payload)
+    language["tracks"][4]["properties"]["language"] = "jpn"
+    with pytest.raises(m.MatroskaBuildError, match="不一致"):
+        m.require_segment_track_correspondence(
+            first, m._segment_track_facts(language), label="第 2/3 段（play item 1）")
+
+    # 视频事实（识别层不提供的档次/帧率/时间基用 ffprobe 事实补齐）
+    with pytest.raises(m.MatroskaBuildError, match="视频事实"):
+        m.require_segment_video_correspondence(
+            {"codec_name": "hevc", "profile": "Main 10", "width": 3840,
+             "avg_frame_rate": "24000/1001", "time_base": "1/90000"},
+            {"codec_name": "hevc", "profile": "Main", "width": 3840,
+             "avg_frame_rate": "24000/1001", "time_base": "1/90000"},
+            label="第 2/3 段（play item 1）",
+        )
+
+
+def test_segment_track_correspondence_accepts_pure_subset():
+    """纯子集缺失（后段少一条字幕轨，无新增无漂移）返回事实而不是失败。
+
+    2026-09-14 越南战争：终段少声明两条 PGS，母盘原生播放同此，失败关闭会
+    让该标题永远不可交付。
+    """
+    import copy
+    import bluray_fidelity.matroska as m
+
+    payload = copy.deepcopy(_input_identification())
+    first = m._segment_track_facts(payload)
+    subset = copy.deepcopy(payload)
+    subset["tracks"] = [t for t in subset["tracks"] if t["id"] != 6]
+
+    variance = m.require_segment_track_correspondence(
+        first, m._segment_track_facts(subset), label="第 19/19 段（play item 18）")
+
+    assert variance is not None
+    assert variance.missing == (("subtitles", 4769),)
+    detail = variance.detail()
+    assert "第 19/19 段（play item 18）" in detail
+    assert "缺少 subtitles/pid=0x12a1[id=6|HDMV PGS|und]" in detail
+    assert "按子集放行" in detail
+
+    # 同一 (type, pid) 换成别的表达是漂移不是子集：必须失败关闭。
+    replaced = copy.deepcopy(payload)
+    replaced["tracks"][6]["properties"]["language"] = "jpn"
+    with pytest.raises(m.MatroskaBuildError, match="不一致"):
+        m.require_segment_track_correspondence(
+            first, m._segment_track_facts(replaced), label="第 2/3 段（play item 1）")
+
+
+def test_multiclip_mid_subset_fails_closed(tmp_path, monkeypatch, caplog):
+    """中段纯子集：无法按尾部排除（跳过中段=连续性被破坏）→ 失败关闭并点名。
+
+    2026-09-15 实测（越南战争）：子集段追加进成品会让 mkvmerge 汇总出的容器**没有
+    时长**（"最终 MKV 缺少有效时长/Cues 信息"，被管线成品门拒绝；单独 mux 该段或只
+    追加完全对应的段则正常）。因此中段子集不再是"放行"，而是失败关闭；**尾部**子集
+    按尾部排除处理（见 test_multiclip_trailing_subset_is_excluded_with_facts）。
+    """
+    import bluray_fidelity.matroska as m
+
+    asset = _multiclip_asset(tmp_path)
+    output = tmp_path / "final.mkv.partial"
+    payload = _input_identification()
+    payload["tracks"] = [track for track in payload["tracks"] if track["id"] != 6]
+
+    capture: dict = {}
+    with pytest.raises(m.MatroskaBuildError, match="无法按尾部排除"):
+        _run_multiclip_build(
+            monkeypatch, tmp_path, asset=asset, capture=capture,
+            payloads={f"{output.name}.item1.m2ts": payload},
+        )
+    assert capture["commands"] == [], "失败关闭时封装命令不得发出"
+
+
+def test_multiclip_trailing_subset_is_excluded_with_facts(tmp_path, monkeypatch, caplog):
+    """尾部纯子集（末段少声明若干轨）显式排除并留痕：不并入成品、不静默。
+
+    越南战争 item 17（173s 预告）少声明两条 PGS：把它追加进成品会让 mkvmerge 汇总
+    出的容器没有时长（实测），故与漂移段同样按尾部排除处理，成品只含完全对应的段。
+    """
+    asset = _multiclip_asset(tmp_path)
+    output = tmp_path / "final.mkv.partial"
+    payload = _input_identification()
+    payload["tracks"] = [track for track in payload["tracks"] if track["id"] != 6]
+
+    with caplog.at_level("WARNING", logger="hdathome.matroska"):
+        capture = _run_multiclip_build(
+            monkeypatch, tmp_path, asset=asset,
+            payloads={f"{output.name}.item2.m2ts": payload},
+        )
+
+    (command,) = capture["commands"]
+    segments = [output.with_name(f"{output.name}.item{index}.m2ts")
+                for index in range(3)]
+    assert [token for token in command if token.endswith(".m2ts")] == [
+        str(segments[0]), str(segments[1]),
+    ]
+    text = "\n".join(record.getMessage() for record in caplog.records
+                     if record.name == "hdathome.matroska")
+    assert "已显式排除" in text
+    assert "纯子集" in text
+
+
+def test_multiclip_video_disagreement_fails_closed_before_mux(tmp_path, monkeypatch):
+    """后段视频事实（分辨率）与首段不一致：失败关闭，封装命令从未发出。"""
+    import bluray_fidelity.matroska as m
+
+    asset = _multiclip_asset(tmp_path)
+    output = tmp_path / "final.mkv.partial"
+    capture: dict = {}
+
+    def streams(source):
+        return _b2_streams(width=1920 if Path(source).name.endswith("item1.m2ts") else 3840)
+
+    with pytest.raises(m.MatroskaBuildError, match="视频事实") as error:
+        _run_multiclip_build(
+            monkeypatch, tmp_path, asset=asset, capture=capture, streams=streams,
+        )
+    assert "width 首段[3840]≠本段[1920]" in str(error.value)
+    assert capture["commands"] == []
+    # 同上：多段全核对后才判定是否可按尾部排除；封装命令从未发出。
+    assert capture["read_items"] == [0, 1, 2]
+
+
+def test_multiclip_route_accepts_dv_via_segment_builder(tmp_path, monkeypatch):
+    """2026-09-24（用户裁定「这条也能做」）：多段 DV **不再失败关闭**。
+
+    每段先做**段级 DV 构建**（BL+EL 用 dovi_tool 合并、官方音轨/字幕由 ffmpeg
+    重封成中间件并进段），成品再按播放序**纯追加**；DV 证据按播放序聚合后交给统一
+    的 Profile 7 成品门，官方轨映射取**段级实测**（这类盘的原始分段 mkvmerge 读不到
+    音轨，用它算映射会让成品门误判数量——生产实测 9≠8 被拒）。
+    """
+    import bluray_fidelity.matroska as m
+    from bluray_fidelity.matroska import MatroskaBuilder, ResolvedTracks
+
+    asset = _multiclip_asset(tmp_path)
+    dv_asset = replace(asset, video_tracks=(
+        BlurayTrack(index=0, pid=0x1011, coding_type=0x24, language=""),
+        BlurayTrack(index=1, pid=0x1015, coding_type=0x24, language=""),
+    ))
+
+    dv_calls: list[tuple[str, dict | None]] = []
+    gate_calls: list = []
+    vision_calls: list = []
+
+    def fake_dv_segment(self, asset_, source, target, progress, *, label, layout):
+        dv_calls.append((label, layout))
+        target.write_bytes(b"dv-segment")
+        resolved = ResolvedTracks(
+            video_ids=(0,), audio_ids=(0, 1), subtitle_ids=(0,),
+            audio_by_official_index=((0, 0), (1, 1)),
+            subtitle_by_official_index=((0, 0),))
+        return {
+            "path": target, "resolved": resolved,
+            "official_audio": (0, 1), "official_subtitle": (0,),
+            "evidence": {
+                "label": label, "dovi_executable": "/usr/local/bin/dovi_tool",
+                "bl_size": 10, "merged_size": 20, "el_digests": [f"d-{label}"],
+                "el_stats": {"vcl_count": 1, "payload_bytes": 5},
+                "merged_rpu_evidence": {"method": "dovi_tool extract-rpu",
+                                        "limit_frames": 240, "rpu_file_size": 7},
+                "fps": 23.976, "duration_s": 300.0,
+                "audio_tracks": 2, "subtitle_tracks": 1,
+                "official_audio_indices": [0, 1],
+                "official_subtitle_indices": [0],
+                "skipped_same_pid_streams": 0,
+                "source_pids": {"base": 4113, "enhancement": 4117},
+            },
+        }
+
+    monkeypatch.setattr(MatroskaBuilder, "_dv_segment", fake_dv_segment)
+    monkeypatch.setattr(m, "_verify_dv_profile7_evidence",
+                        lambda *a, **k: gate_calls.append(a))
+    monkeypatch.setattr(MatroskaBuilder, "_verify_dolby_vision",
+                        lambda self, output: vision_calls.append(output))
+
+    capture = _run_multiclip_build(
+        monkeypatch, tmp_path, asset=dv_asset, output_name="multiclip-dv.mkv.partial")
+
+    assert len(dv_calls) == 3, "三段都必须走段级 DV 构建"
+    assert dv_calls[0][1] is None, "首段确立官方轨集合"
+    assert all(layout is not None for _, layout in dv_calls[1:]), \
+        "后续段必须拿到首段布局做一致性核对"
+    append_commands = [command for command in capture["commands"] if "+" in command]
+    assert append_commands, "多段 DV 成品必须是纯追加（时间轴按段续接）"
+    assert gate_calls, "多段 DV 成品必须过统一 Profile 7 证据门"
+    assert vision_calls, "多段 DV 成品必须过容器 DOVI 配置记录校验"
+
+
+def test_multiclip_dv_flaky_track_identify_no_longer_excludes_segments(
+    tmp_path, monkeypatch,
+):
+    """DV 多段：原始分段的 mkvmerge 轨识别不可靠时不再逐段核对轨对应、不再尾部排除。
+
+    2026-09-24 生产实测（《阿凡达》加长版 33 段）：mkvmerge 对原始分段逐段识别
+    不一致（首段见 2 条音轨、其余段见 0 条），旧检查把段 2..33 全判违规尾部排除，
+    成品只剩第 1 段后被 EL 一致性门拒绝。DV 路线的轨布局由官方 PID 计划重建，
+    该检查在 DV 路径既不可靠也不必需——现在跳过，全部段进入段级 DV 构建与纯追加。
+    """
+    import bluray_fidelity.matroska as m
+    from bluray_fidelity.matroska import MatroskaBuilder, ResolvedTracks
+
+    asset = _multiclip_asset(tmp_path)
+    dv_asset = replace(asset, video_tracks=(
+        BlurayTrack(index=0, pid=0x1011, coding_type=0x24, language=""),
+        BlurayTrack(index=1, pid=0x1015, coding_type=0x24, language=""),
+    ))
+    output = tmp_path / "multiclip-dv.mkv.partial"
+    # 段 2/3 的 mkvmerge 识别缺全部音轨（与首段不同）——旧行为：判违规→尾部排除。
+    audio_less = _input_identification()
+    audio_less["tracks"] = [
+        track for track in audio_less["tracks"] if track["type"] != "audio"
+    ]
+
+    dv_calls: list[tuple[str, dict | None]] = []
+
+    def fake_dv_segment(self, asset_, source, target, progress, *, label, layout):
+        dv_calls.append((label, layout))
+        target.write_bytes(b"dv-segment")
+        resolved = ResolvedTracks(
+            video_ids=(0,), audio_ids=(0, 1), subtitle_ids=(0,),
+            audio_by_official_index=((0, 0), (1, 1)),
+            subtitle_by_official_index=((0, 0),))
+        return {
+            "path": target, "resolved": resolved,
+            "official_audio": (0, 1), "official_subtitle": (0,),
+            "evidence": {
+                "label": label, "dovi_executable": "/usr/local/bin/dovi_tool",
+                "bl_size": 10, "merged_size": 20, "el_digests": [f"d-{label}"],
+                "el_stats": {"vcl_count": 1, "payload_bytes": 5},
+                "merged_rpu_evidence": {"method": "dovi_tool extract-rpu",
+                                        "limit_frames": 240, "rpu_file_size": 7},
+                "fps": 23.976, "duration_s": 300.0,
+                "audio_tracks": 2, "subtitle_tracks": 1,
+                "official_audio_indices": [0, 1],
+                "official_subtitle_indices": [0],
+                "skipped_same_pid_streams": 0,
+                "source_pids": {"base": 4113, "enhancement": 4117},
+            },
+        }
+
+    monkeypatch.setattr(MatroskaBuilder, "_dv_segment", fake_dv_segment)
+    monkeypatch.setattr(m, "_verify_dv_profile7_evidence", lambda *a, **k: None)
+    monkeypatch.setattr(MatroskaBuilder, "_verify_dolby_vision",
+                        lambda self, output: None)
+
+    capture = _run_multiclip_build(
+        monkeypatch, tmp_path, asset=dv_asset, output_name=output.name,
+        payloads={f"{output.name}.item1.m2ts": audio_less,
+                  f"{output.name}.item2.m2ts": audio_less},
+    )
+
+    assert len(dv_calls) == 3, "三段都必须走段级 DV 构建（不再被尾部排除）"
+    append_commands = [c for c in capture["commands"] if "+" in c]
+    assert len(append_commands) == 1, "成品应是单条追加命令"
+    assert append_commands[0].count("+") == 2, "全部三段进入纯追加，无尾部排除"
+
+
+def test_multiclip_dv_trailing_video_disagreement_fails_closed(
+    tmp_path, monkeypatch,
+):
+    """DV 多段不允许尾部排除：尾部段视频事实漂移 → 显式失败关闭（不静默截断）。
+
+    2026-09-24：DV 段级轨布局由官方 PID 计划重建，任何结构违规都意味着成品会
+    缺段，而 EL 一致性门比对的是全片源序列——必须立即失败关闭而不是尾部排除。
+    """
+    import bluray_fidelity.matroska as m
+    from bluray_fidelity.matroska import MatroskaBuilder
+
+    asset = _multiclip_asset(tmp_path)
+    dv_asset = replace(asset, video_tracks=(
+        BlurayTrack(index=0, pid=0x1011, coding_type=0x24, language=""),
+        BlurayTrack(index=1, pid=0x1015, coding_type=0x24, language=""),
+    ))
+
+    def streams(source):
+        return _b2_streams(
+            width=1920 if Path(source).name.endswith("item2.m2ts") else 3840)
+
+    monkeypatch.setattr(
+        MatroskaBuilder, "_dv_segment",
+        lambda self, *a, **k: {
+            "path": a[1].with_name(a[1].name + ".dv.mkv"),
+            "resolved": None,
+            "official_audio": (), "official_subtitle": (),
+            "evidence": {}})
+
+    capture: dict = {}
+    with pytest.raises(m.MatroskaBuildError, match="DV 多段合辑不允许尾部排除段"):
+        _run_multiclip_build(
+            monkeypatch, tmp_path, asset=dv_asset, capture=capture, streams=streams,
+        )
+    assert capture["commands"] == []
+
+
+def test_multiclip_route_fails_closed_for_hdr10plus(tmp_path, monkeypatch):
+    """HDR10+ 仍需整片剥离后封装：多段追加无法表达，点名拒绝、不退回字节拼接。"""
+    import bluray_fidelity.matroska as m
+
+    asset = _multiclip_asset(tmp_path)
+    capture: dict = {}
+    with pytest.raises(m.MatroskaBuildError, match=r"HDR10\+"):
+        _run_multiclip_build(
+            monkeypatch, tmp_path, asset=asset, capture=capture,
+            output_name="hdr10.mkv.partial",
+            hdr10plus=lambda path: path.name.endswith("item1.m2ts"),
+        )
+    assert capture["read_items"] == [0, 1]
+    assert capture["commands"] == []
+
+
+def test_dv_segment_command_uses_official_mapping(tmp_path):
+    """段级 DV 封装命令：语言/默认轨按官方映射注入；缺中间件则失败关闭。"""
+    from bluray_fidelity.matroska import (
+        MatroskaBuildError, ResolvedTracks, build_dv_segment_command,
+    )
+
+    asset = replace(
+        _asset(tmp_path),
+        audio_tracks=(
+            BlurayTrack(index=0, pid=0x1100, coding_type=0x83, language="eng"),
+            BlurayTrack(index=1, pid=0x1101, coding_type=0x81, language="chi"),
+        ),
+        subtitle_tracks=(
+            BlurayTrack(index=0, pid=0x12A0, coding_type=0x90, language="chi"),
+        ),
+    )
+    merged = tmp_path / "merged.hevc"
+    merged.write_bytes(b"v")
+    audio_ts = tmp_path / "audio.ts"
+    audio_ts.write_bytes(b"a")
+    subs_ts = tmp_path / "subs.ts"
+    subs_ts.write_bytes(b"s")
+    resolved = ResolvedTracks(
+        video_ids=(0,), audio_ids=(0, 1), subtitle_ids=(0,),
+        audio_by_official_index=((0, 0), (1, 1)),
+        subtitle_by_official_index=((0, 0),))
+    command = build_dv_segment_command(
+        asset, merged, audio_ts, subs_ts, tmp_path / "seg.dv.mkv", title="段",
+        resolved=resolved)
+    assert "0:eng" in command and "1:chi" in command
+    # 默认轨只打在中文音轨（asset.default_audio_index == 1）与中文字幕上
+    assert "1:yes" in command
+    assert command.count("--default-track-flag") == 4, "视频 1 + 音频 2 + 字幕 1"
+    with pytest.raises(MatroskaBuildError, match="音轨中间件"):
+        build_dv_segment_command(
+            asset, merged, tmp_path / "missing.ts", subs_ts,
+            tmp_path / "seg2.dv.mkv", title="段", resolved=resolved)
+
+
+def test_aggregate_multiclip_dv_facts_concatenates_in_play_order(tmp_path):
+    """多段 DV 证据聚合：EL 序列按播放序拼接、体积求和；缺段证据即失败关闭。"""
+    from bluray_fidelity.matroska import (
+        MatroskaBuildError, _aggregate_multiclip_dv_facts,
+    )
+
+    def evidence(label, digest, bl, merged, rpu):
+        return {"label": label, "dovi_executable": "/usr/local/bin/dovi_tool",
+                "bl_size": bl, "merged_size": merged, "el_digests": [digest],
+                "el_stats": {"vcl_count": 1, "payload_bytes": 3},
+                "merged_rpu_evidence": {"method": "dovi_tool extract-rpu",
+                                        "limit_frames": 240, "rpu_file_size": rpu},
+                "fps": 23.976, "duration_s": 10.0}
+
+    facts = _aggregate_multiclip_dv_facts([
+        evidence("分段 1", "a", 10, 20, 5), evidence("分段 2", "b", 30, 60, 7),
+    ])
+    assert facts["el_source_digests"] == ["a", "b"], "必须按播放序拼接"
+    assert facts["bl_size"] == 40 and facts["merged_size"] == 80
+    assert facts["duration_s"] == 20.0
+    assert facts["merged_rpu_evidence"]["rpu_file_size"] == 12
+    with pytest.raises(MatroskaBuildError, match="RPU 证据"):
+        _aggregate_multiclip_dv_facts([evidence("分段 1", "a", 10, 20, 0)])
+    with pytest.raises(MatroskaBuildError, match="证据为空"):
+        _aggregate_multiclip_dv_facts([])
+
+
+def test_official_stream_plan_takes_one_stream_per_official_pid(tmp_path):
+    """每个官方 PID 只取第一条流（同 PID 的第二条不另立轨），并如实记略过数。
+
+    同 PID 的第二条流 = TrueHD 的内嵌 AC-3 core：官方表只声明一条，若另立轨
+    成品就是 9 条 vs 官方 8 条 ⇒ 成品门「音轨数量与可映射 MPLS 音轨不一致」。
+    """
+    from bluray_fidelity.matroska import MatroskaBuilder
+
+    asset = replace(
+        _asset(tmp_path),
+        audio_tracks=(
+            BlurayTrack(index=0, pid=0x1100, coding_type=0x83, language="eng"),
+            BlurayTrack(index=1, pid=0x1101, coding_type=0x81, language="chi"),
+        ),
+        subtitle_tracks=(
+            BlurayTrack(index=0, pid=0x12A0, coding_type=0x90, language="chi"),
+        ),
+    )
+    assert asset.default_audio_index == 1
+    pid_index = {0x1100: [2, 3], 0x1101: [4], 0x12A0: [11]}
+    indices, entries, skipped = MatroskaBuilder._official_stream_plan(
+        asset, pid_index, "audio")
+    assert indices == [2, 4], "每个官方 PID 只取第一条流"
+    assert [entry.index for entry in entries] == [0, 1]
+    assert skipped == 1, "同 PID 的第二条流如实记入略过数"
+    sub_indices, sub_entries, sub_skipped = MatroskaBuilder._official_stream_plan(
+        asset, pid_index, "subtitle")
+    assert sub_indices == [11] and [e.index for e in sub_entries] == [0]
+    assert sub_skipped == 0
+
+
+def test_multiclip_seam_gates_check_duration_continuity_and_seek_targets(tmp_path, monkeypatch):
+    """拼接门全部从成品可复核：总时长、拼接点时间戳（回跳/空档/未覆盖）、
+    拼接点进入同一套 seek 门。"""
+    import bluray_fidelity.matroska as m
+    from bluray_fidelity.matroska import MatroskaBuilder
+
+    asset = _multiclip_asset(tmp_path)  # 三段各 300s
+    output = tmp_path / "final.mkv"
+    output.write_bytes(b"x")
+    builder = MatroskaBuilder()
+    monkeypatch.setattr(m, "_probe_video_timeline", lambda *a, **k: {"start_time": "0.000000"})
+    seam_targets: list = []
+    monkeypatch.setattr(
+        m, "_verify_cues_and_seek",
+        lambda _probe, _path, _ns, **kw: seam_targets.extend(kw.get("extra_targets", ())),
+    )
+
+    def packets(offsets):
+        """按拼接点相对偏移产出包：窄窗（判定用）后接加宽窗（本例无余量）。"""
+        def fake(_probe, _path, start, diag=None, **kwargs):
+            seam = start + m._SEAM_HALF_WINDOW_SECONDS
+            return [{"pts_time": str(seam + offset)} for offset in offsets]
+        return fake
+
+    monkeypatch.setattr(m, "_record_wide_window", lambda *a, **k: None)
+
+    monkeypatch.setattr(m, "_probe_duration", lambda *a, **k: 900.0)
+    monkeypatch.setattr(m, "_probe_interval_packets", packets((-0.5, 0.04)))
+    builder._verify_multiclip_seams(asset, output, _MULTICLIP_BOUNDS)
+    assert seam_targets == [300.0, 600.0]
+
+    monkeypatch.setattr(m, "_probe_duration", lambda *a, **k: 890.0)
+    with pytest.raises(MatroskaBuildError, match="Σ play item 时长"):
+        builder._verify_multiclip_seams(asset, output, _MULTICLIP_BOUNDS)
+
+    # 追加段重启时间轴：探针顺序内出现秒级回退。
+    monkeypatch.setattr(m, "_probe_duration", lambda *a, **k: 900.0)
+    monkeypatch.setattr(m, "_probe_interval_packets", packets((-0.1, 0.1, -4.5)))
+    with pytest.raises(MatroskaBuildError, match="时间戳回跳"):
+        builder._verify_multiclip_seams(asset, output, _MULTICLIP_BOUNDS)
+
+    # 拼接处内容缺口（两侧都有包但空档超限）。
+    monkeypatch.setattr(m, "_probe_interval_packets", packets((-4.0, 0.5)))
+    with pytest.raises(MatroskaBuildError, match="空档"):
+        builder._verify_multiclip_seams(asset, output, _MULTICLIP_BOUNDS)
+
+    # 拼接点后侧没有包（后段缺失/错位）。
+    monkeypatch.setattr(m, "_probe_interval_packets", packets((3.0,)))
+    with pytest.raises(MatroskaBuildError, match="未覆盖拼接点"):
+        builder._verify_multiclip_seams(asset, output, _MULTICLIP_BOUNDS)
+
+    # 判定只用窄窗：加宽窗是拼接门失败详情里的测量（只测量，不改判定）。
+    probed: list[float] = []
+
+    def recording(_probe, _path, start, diag=None, **kwargs):
+        probed.append(float(kwargs.get("window_seconds", 0.0)))
+        seam = start + m._SEAM_HALF_WINDOW_SECONDS
+        return [{"pts_time": str(seam - 0.5)}, {"pts_time": str(seam + 0.04)}]
+
+    monkeypatch.setattr(m, "_probe_interval_packets", recording)
+    builder._verify_multiclip_seams(asset, output, _MULTICLIP_BOUNDS)
+    assert probed == [2 * m._SEAM_HALF_WINDOW_SECONDS] * 2
+
+
+def test_seam_gate_accepts_dts_only_video_packets(tmp_path, monkeypatch):
+    """VC-1 成品只有 DTS（pts_time=N/A）时拼接门必须照样通过。
+
+    2026-09-15 真盘实证：地球脉动 dlv_720414a5…（VC-1 1080i）的 mkvmerge 成品里
+    视频包只有 DTS；只认 PTS 的窗口判定把内容完好的拼接点报成"附近无视频包"并
+    拒绝发布（窄窗 [3065,3075] 按 DTS 有 240 个视频包、时间轴连续；按 PTS 为 0）。
+    """
+    import bluray_fidelity.matroska as m
+    from bluray_fidelity.matroska import MatroskaBuilder
+
+    asset = _multiclip_asset(tmp_path)
+    output = tmp_path / "final.mkv"
+    output.write_bytes(b"x")
+    builder = MatroskaBuilder()
+    monkeypatch.setattr(m, "_probe_video_timeline", lambda *a, **k: {"start_time": "0.000000"})
+    monkeypatch.setattr(m, "_verify_cues_and_seek", lambda *a, **k: None)
+    monkeypatch.setattr(m, "_record_wide_window", lambda *a, **k: None)
+    monkeypatch.setattr(m, "_probe_duration", lambda *a, **k: 900.0)
+    monkeypatch.setattr(
+        m, "_probe_interval_packets",
+        lambda _probe, _path, start, diag=None, **kwargs: [
+            {"pts_time": None, "dts_time": str(start + m._SEAM_HALF_WINDOW_SECONDS - 0.5)},
+            {"pts_time": None, "dts_time": str(start + m._SEAM_HALF_WINDOW_SECONDS + 0.04)},
+        ])
+
+    # 不抛异常：DTS 回退后内容覆盖与空档判定都成立
+    builder._verify_multiclip_seams(asset, output, _MULTICLIP_BOUNDS)
+
+    # 两个时间戳都缺 → 仍失败关闭（不放行"完全没有时间戳"的成品）
+    monkeypatch.setattr(
+        m, "_probe_interval_packets",
+        lambda *a, **k: [{"pts_time": None, "dts_time": None}])
+    with pytest.raises(MatroskaBuildError, match="无视频包"):
+        builder._verify_multiclip_seams(asset, output, _MULTICLIP_BOUNDS)
+
+
+def test_seam_gate_failure_is_self_diagnosing_and_preserves_artifact(tmp_path, monkeypatch):
+    """拼接门失败必须自诊断：详情携带窗口/分段可复核事实并点名保留的成品。
+
+    2026-09-14 地球脉动：只报「无视频包」无法区分来源缺头部、append 未续接
+    还是探针越界；成品又被失败路径删掉，无法复检。门仍不放宽（不发布）。
+    """
+    import bluray_fidelity.matroska as m
+    from bluray_fidelity.matroska import MatroskaBuilder
+
+    asset = _multiclip_asset(tmp_path)  # 三段各 300s
+    _install_multiclip_reader(monkeypatch)
+    output = tmp_path / "final.mkv.partial"
+    # 已发布的分段检查点：逐段字节事实必须取自实际分段文件。
+    for index, (_, length) in enumerate(_MULTICLIP_BOUNDS):
+        output.with_name(f"{output.name}.item{index}.m2ts").write_bytes(b"m" * length)
+    builder = MatroskaBuilder()
+    monkeypatch.setattr(m.shutil, "which", lambda _name: "/usr/bin/mkvmerge")
+    monkeypatch.setattr(builder, "_identify_path", lambda _source: _input_identification())
+    monkeypatch.setattr(builder, "_video_streams", lambda _source: _b2_streams())
+    monkeypatch.setattr(builder, "_has_hdr10plus", lambda _source: False)
+    monkeypatch.setattr(m, "validate_finalized_identification", lambda *a, **k: {})
+    monkeypatch.setattr(m, "require_track_coverage", lambda *a, **k: {})
+
+    class FakeProcess:
+        stdout = iter(())
+
+        def wait(self):
+            output.write_bytes(b"merged-output")
+            return 0
+
+    class FakeCompleted:
+        # 识别必须返回**已识别的容器**（2026-09-17 起有 _require_identified_container
+        # 收口）：空 JSON 会在时长门前被拒，测不到拼接门的自诊断。
+        stdout = json.dumps({
+            "container": {"properties": {"duration": 900_000_000_000}},
+            "tracks": [],
+        })
+
+    monkeypatch.setattr(m.subprocess, "Popen", lambda *a, **k: FakeProcess())
+    monkeypatch.setattr(m.subprocess, "run", lambda *a, **k: FakeCompleted())
+    monkeypatch.setattr(m, "_probe_video_timeline", lambda *a, **k: {"start_time": "0.000000"})
+    monkeypatch.setattr(
+        m, "_probe_duration",
+        lambda _probe, path: 30.0 if Path(path).name.endswith(".item0.m2ts") else 900.0,
+    )
+    monkeypatch.setattr(m, "_probe_interval_packets", lambda *a, **k: [])
+
+    with pytest.raises(m.MatroskaBuildError, match="无视频包") as error:
+        builder.build(asset, output, title="合辑")
+
+    detail = str(error.value)
+    preserved = output.with_name(output.name + ".seam-failure.mkv")
+    # 门不放宽：成品不在发布路径上，但字节仍在沙盒里可复检。
+    assert preserved.read_bytes() == b"merged-output"
+    assert not output.exists()
+    # 原始原因（含拼接点与目标时间）+ 保留路径必须落在执行账本 detail 保留的
+    # 前 300 字符内——保留路径不可被后续清理删除，也不可被详情截断吞掉。
+    assert "多段合辑拼接点 1/2 附近（300.0s）无视频包" in detail[:300]
+    assert 0 <= detail.index(str(preserved)) < 300
+    assert "供复检" in detail
+    assert error.value.seam_diagnostics["preserved"] == str(preserved)
+    # 可测的接缝事实（完整详情在 build 日志与 seam_diagnostics 里）：拼接点
+    # 两侧段、窄窗/加宽窗包数与首末 pts_time、逐段字节与实测时长、成品声明
+    # 时长对 Σ 分段。
+    assert "前段=item0 clip=00001 in=600.0s out=900.0s 时长=300.0s 字节=[0,30)" in detail
+    assert "后段=item1 clip=00002 in=0.0s out=300.0s 时长=300.0s 字节=[30,50)" in detail
+    assert "窄窗=295.0s→305.0s 视频包=0 首末pts=None→None" in detail
+    assert "加宽窗=0.0s→300.0s 视频包=0" in detail
+    assert "逐段字节：item0 边界=30B 分段=30B；item1 边界=20B 分段=20B" in detail
+    assert "逐段时长：item0 30.0s；item1 900.0s" in detail
+    assert "成品声明时长=900.0s Σ分段=900.0s" in detail
+    # 分段检查点保留（与失败成品同目录，供复检），published partial 不残留。
+    assert output.with_name(output.name + ".item0.m2ts").read_bytes() == b"m" * 30
+
+
+def test_seam_preserved_path_is_generation_scoped(tmp_path):
+    """保留路径与 partial 名同源（同域不同代互不覆盖）。"""
+    from bluray_fidelity.matroska import seam_preserved_path
+
+    first = seam_preserved_path(tmp_path / "main-title.m2ts.partial.1")
+    second = seam_preserved_path(tmp_path / "main-title.m2ts.partial.2")
+    assert first.name == "main-title.m2ts.partial.1.seam-failure.mkv"
+    assert first.parent == tmp_path and first != second
+
+
+def test_seek_gate_adds_seam_targets_without_relaxing_percent_gates(tmp_path, monkeypatch):
+    """拼接点用与 10/50/90% 完全相同的门与容差（不放松），结果可区分 seam。"""
+    import bluray_fidelity.matroska as m
+
+    output = tmp_path / "out.mkv"
+    output.write_bytes(b"x")
+    monkeypatch.setattr(m, "_count_cue_points", lambda _p: 3)
+    monkeypatch.setattr(
+        m, "_probe_interval_packets",
+        lambda _probe, _path, target, diag=None, **kw: [
+            {"pts_time": str(target), "flags": "K"},
+        ],
+    )
+    monkeypatch.setattr(
+        m, "_probe_interval_frames",
+        lambda _probe, _path, target, diag=None, **kw: [float(target)],
+    )
+    result = m._verify_cues_and_seek(
+        "ffprobe", output, int(900 * 1e9), extra_targets=(300.0, 600.0),
+    )
+    assert [entry["frac"] for entry in result["cues"][:3]] == [0.10, 0.50, 0.90]
+    seams = [entry for entry in result["cues"] if entry.get("seam_index")]
+    assert [entry["seam_index"] for entry in seams] == [1, 2]
+    assert [entry["target_seconds"] for entry in seams] == [300.0, 600.0]
+    assert all(entry["frac"] is None for entry in seams)
+
+    # 拼接点越界同样失败关闭（与百分比目标同一容差、同一门）。
+    def frames_only_percent(_probe, _path, target, diag=None, **kw):
+        return [float(target)] if target in (90.0, 450.0, 810.0) else [999.0]
+
+    monkeypatch.setattr(m, "_probe_interval_frames", frames_only_percent)
+    with pytest.raises(MatroskaBuildError, match="拼接点 1 时间越界"):
+        m._verify_cues_and_seek("ffprobe", output, int(900 * 1e9), extra_targets=(300.0, 600.0))
+
+
+def test_build_artifacts_registers_every_segment_and_checkpoint(tmp_path):
+    """工件清单必须包含每一段（及其 staging）：清理从不 glob，漏登即永久泄漏。"""
+    from bluray_fidelity.matroska import (
+        build_artifacts,
+        is_checkpoint_artifact,
+    )
+
+    partial = tmp_path / "main-title.m2ts.partial.7"
+    single = build_artifacts(partial)
+    assert single.segments == () and single.staging_segments == ()
+    assert single.as_artifacts_list() == [
+        str(partial),
+        str(partial.with_name(partial.name + ".source.m2ts")),
+        str(partial.with_name("main-title.materializing")),
+        str(partial.with_name("build-7.log")),
+    ]
+
+    multi = build_artifacts(partial, segment_count=3)
+    listed = multi.as_artifacts_list()
+    for index in range(3):
+        assert str(partial.with_name(f"{partial.name}.item{index}.m2ts")) in listed
+        assert str(partial.with_name(f"main-title.materializing.item{index}")) in listed
+    assert multi.checkpoint_paths() == (
+        partial.with_name(partial.name + ".source.m2ts"),
+        partial.with_name(partial.name + ".item0.m2ts"),
+        partial.with_name(partial.name + ".item1.m2ts"),
+        partial.with_name(partial.name + ".item2.m2ts"),
+    )
+    assert is_checkpoint_artifact(partial.name + ".source.m2ts")
+    assert is_checkpoint_artifact(partial.name + ".item12.m2ts")
+    assert not is_checkpoint_artifact(partial.name)
+    assert not is_checkpoint_artifact("main-title.materializing.item0")
+    assert not is_checkpoint_artifact(partial.name + ".itemX.m2ts")
+
+
+def test_out_of_space_is_transient_not_media_defect(tmp_path, monkeypatch):
+    """空间耗尽按瞬时故障重试（永久分类会烧掉重试预算），媒体缺陷仍永久。"""
+    import errno
+    import bluray_fidelity.matroska as m
+    from bluray_fidelity.matroska import (
+        MatroskaBuilder,
+        TransientMatroskaBuildError,
+    )
+
+    assert m._is_out_of_space(OSError(errno.ENOSPC, "No space left on device"))
+    assert m._is_out_of_space("Error: No space left to write to 'out.mkv'")
+    assert not m._is_out_of_space("Error: Invalid state")
+
+    # 物化阶段 ENOSPC：单文件路线外层收口为瞬时。
+    asset = _asset(tmp_path)
+
+    def failing_materialize(_asset, source, progress=None, staging=None):
+        raise OSError(errno.ENOSPC, "No space left on device")
+
+    monkeypatch.setattr(MatroskaBuilder, "_materialize_title",
+                        staticmethod(failing_materialize))
+    monkeypatch.setattr(m.shutil, "which", lambda _name: "/usr/bin/mkvmerge")
+    with pytest.raises(TransientMatroskaBuildError, match="空间不足"):
+        MatroskaBuilder().build(asset, tmp_path / "out.mkv", title="x")
+
+    # 分段物化阶段 ENOSPC：多段路线同样瞬时。
+    capture: dict = {}
+
+    def failing_items(_asset, item_index, chunk_size=1 << 20):
+        raise OSError(errno.ENOSPC, "No space left on device")
+
+    monkeypatch.setattr(m, "bluray_item_bounds", lambda _asset: _MULTICLIP_BOUNDS)
+    monkeypatch.setattr(m, "iter_bluray_item", failing_items)
+    with pytest.raises(TransientMatroskaBuildError, match="空间不足"):
+        MatroskaBuilder().build(_multiclip_asset(tmp_path), tmp_path / "multi.mkv",
+                                title="x")
+
+    # mkvmerge 非零退出且明文为空间不足：瞬时（优先判定）；退出码 1=有警告，
+    # 成品继续走独立校验门；退出码 2=错误（man mkvmerge：0=成功、1=警告、
+    # 2=错误并立即中止），必须失败关闭。
+    def build_with_mux_output(text: str, code: int):
+        class FakeProcess:
+            stdout = iter((text + "\n",))
+
+            def wait(self):
+                return code
+
+        builder = MatroskaBuilder()
+        monkeypatch.setattr(builder, "_materialize_title",
+                            staticmethod(lambda _a, source, **k: source.write_bytes(b"m")))
+        monkeypatch.setattr(builder, "_identify_path",
+                            lambda _source: _input_identification())
+        monkeypatch.setattr(builder, "_video_streams", lambda _source: [])
+        monkeypatch.setattr(builder, "_has_hdr10plus", lambda _source: False)
+        monkeypatch.setattr(m.subprocess, "Popen", lambda *a, **k: FakeProcess())
+        monkeypatch.setattr(m, "validate_finalized_identification", lambda *a, **k: {})
+        monkeypatch.setattr(m, "require_track_coverage", lambda *a, **k: {})
+
+        class FakeRun:
+            returncode = 0
+            stderr = ""
+            stdout = json.dumps(_input_identification())
+
+        monkeypatch.setattr(m.subprocess, "run", lambda *a, **k: FakeRun())
+        monkeypatch.setattr(MatroskaBuilder, "_verify_seekable", lambda *a, **k: None)
+        return builder.build(asset, tmp_path / "out2.mkv", title="x")
+
+    with pytest.raises(TransientMatroskaBuildError, match="空间不足"):
+        build_with_mux_output("Error: No space left to write to 'out2.mkv'", 2)
+    # 退出码 1 = 有警告（输出有效）：不失败，警告文本必须进构建结果（可复核）。
+    result = build_with_mux_output("Warning: something odd", 1)
+    assert "something odd" in result.get("mkvmerge_warnings", "")
+    # 退出码 2 = 错误：失败关闭并带 mkvmerge 原文——绝不能像旧实现那样当
+    # "已完成但有警告"继续，最终把硬封装失败伪装成成品门的时长/Cues 失败。
+    with pytest.raises(MatroskaBuildError,
+                       match=r"mkvmerge 生成失败（退出码 2）.*Invalid state"):
+        build_with_mux_output("Error: Invalid state", 2)
+
+
+def test_variant_routes_refuse_multiclip_titles(tmp_path, monkeypatch):
+    """不能按 play item 追加的路线点名拒绝，且不物化、不产出文件。"""
+    import bluray_fidelity.matroska as m
+    from bluray_fidelity.matroska import (
+        FfmpegDvFileMatroskaBuilder,
+        FfmpegFileMatroskaBuilder,
+        FifoMatroskaBuilder,
+    )
+
+    asset = _multiclip_asset(tmp_path)
+    monkeypatch.setattr(m.shutil, "which", lambda _name: f"/usr/bin/{_name}")
+    materialized: list = []
+    for builder_cls in (FfmpegFileMatroskaBuilder, FfmpegDvFileMatroskaBuilder):
+        monkeypatch.setattr(builder_cls, "_materialize_or_reuse_title",
+                            lambda self, *a, **k: materialized.append(a))
+        with pytest.raises(MatroskaBuildError, match="不支持按 play item 分段追加"):
+            builder_cls().build(asset, tmp_path / f"{builder_cls.__name__}.mkv", title="合辑")
+    with pytest.raises(MatroskaBuildError, match="FIFO"):
+        FifoMatroskaBuilder().build(asset, tmp_path / "fifo.mkv", title="合辑")
+    assert materialized == []
+    assert not list(tmp_path.glob("*.mkv"))
+
+
+def test_multiclip_compilation_summary_is_bounded_and_specific(tmp_path):
+    """P2：多段合辑记录逐段 in/out 事实（有界）且不改写时间轴；in_time 全零
+    的多剪辑与单剪辑都不产生记录。"""
+    import bluray_fidelity.bluray as bluray
+    import bluray_fidelity.matroska as m
+
+    clips = tuple(
+        bluray.BlurayClip(index=index, clip_id=f"{index + 1:05d}",
+                          in_time=54000000, out_time=81000000)
+        for index in range(9)
+    )
+    asset = replace(_asset(tmp_path), clip_count=9, clips=clips)
+    summary = m.describe_multiclip_compilation(asset)
+    assert summary is not None
+    assert "多段合辑主片" in summary and "playlist=801" in summary
+    assert "#0 00001 in=600.0s out=900.0s" in summary
+    assert "…(+4)" in summary, "超过逐段记录上限必须标记截断"
+    assert len(summary) <= m._MULTICLIP_LOG_WIDTH
+
+    zero_base = replace(
+        asset,
+        clips=tuple(
+            replace(clip, in_time=0, out_time=27000000) for clip in clips
+        ),
+    )
+    assert m.describe_multiclip_compilation(zero_base) is None
+    assert m.describe_multiclip_compilation(
+        replace(asset, clip_count=1, clips=clips[:1])) is None
+
+
+def test_fifo_route_records_multiclip_compilation(tmp_path, monkeypatch, caplog):
+    """P2：FIFO 路线不经物化复用钩子，合辑结构也必须留下同样的逐段记录。"""
+    import bluray_fidelity.bluray as bluray
+    import bluray_fidelity.matroska as m
+    from bluray_fidelity.matroska import FifoMatroskaBuilder
+
+    asset = replace(
+        _asset(tmp_path),
+        clips=(
+            bluray.BlurayClip(index=0, clip_id="00001",
+                              in_time=54000000, out_time=81000000),
+            bluray.BlurayClip(index=1, clip_id="00002",
+                              in_time=54000000, out_time=81000000),
+        ),
+    )
+    builder = FifoMatroskaBuilder()
+
+    class FakeProcess:
+        stdout = iter(())
+
+        def wait(self):
+            return 1
+
+    monkeypatch.setattr(m.shutil, "which", lambda _name: "/usr/bin/ffmpeg")
+    monkeypatch.setattr(FifoMatroskaBuilder, "_probe_source_layout",
+                        staticmethod(lambda *args, **kwargs: []))
+    monkeypatch.setattr(FifoMatroskaBuilder, "_inject_track_metadata",
+                        staticmethod(lambda cmd, *args, **kwargs: cmd))
+    # 不建真实 FIFO：喂入线程立即以 OSError 结束，本测试只验证记录与失败收口。
+    monkeypatch.setattr(m.os, "mkfifo", lambda _path: None)
+    monkeypatch.setattr(m, "iter_bluray_title", lambda *args, **kwargs: iter(()))
+    monkeypatch.setattr(m.subprocess, "Popen", lambda *args, **kwargs: FakeProcess())
+
+    with caplog.at_level("WARNING", logger="hdathome.matroska"):
+        with pytest.raises(MatroskaBuildError):
+            builder.build(asset, tmp_path / "fifo.mkv", title="合辑")
+    text = "\n".join(
+        record.getMessage() for record in caplog.records
+        if record.name == "hdathome.matroska"
+    )
+    assert "多段合辑主片" in text
+    assert "#0 00001 in=600.0s out=900.0s" in text
+
+
+def test_primary_video_pid_rejects_source_whose_official_pid_has_no_picture():
+    """2026-09-14 霸王别姬实测：DIY 重制盘的 MPLS 官方视频 PID 与真实画面 PID 不一致。
+
+    官方表记 0x1011 而该流宽高为空，真实 3840x2160 在 0x1fff。按官方 PID
+    抽裸 HEVC 只会得到无参数集的空流（ffmpeg: dimensions not set / 退出码
+    234）。必须点名两个 PID 拒绝，而不是把它当编码器报错。
+    """
+    asset = BlurayTitleAsset(
+        root=Path("/tmp/disc.iso"),
+        entry_path="HDATHOME/MAIN_TITLE.m2ts",
+        title_index=2,
+        playlist=4,
+        duration_90k=926_395_470,
+        size=111_704_180_736,
+        clip_count=1,
+        source_kind="iso",
+        video_tracks=(BlurayTrack(index=0, pid=0x1011, coding_type=0x24,
+                                  language="und"),),
+    )
+    streams = [
+        {"codec_type": "video", "id": "0x1011", "codec_name": "hevc",
+         "width": 0, "height": 0},
+        {"codec_type": "video", "id": "0x1fff", "codec_name": "hevc",
+         "width": 3840, "height": 2160},
+    ]
+
+    with pytest.raises(MatroskaBuildError) as error:
+        MatroskaBuilder()._primary_video_pid(asset, streams)
+
+    message = str(error.value)
+    assert "0x1011" in message
+    assert "0x1fff" in message
+    assert "非标准重制盘" in message
+
+
+def test_primary_video_pid_keeps_official_pid_when_it_carries_picture():
+    asset = BlurayTitleAsset(
+        root=Path("/tmp/disc.iso"),
+        entry_path="HDATHOME/MAIN_TITLE.m2ts",
+        title_index=2,
+        playlist=4,
+        duration_90k=926_395_470,
+        size=1,
+        clip_count=1,
+        source_kind="iso",
+        video_tracks=(BlurayTrack(index=0, pid=0x1011, coding_type=0x24,
+                                  language="und"),),
+    )
+    streams = [
+        {"codec_type": "video", "id": "0x1011", "codec_name": "hevc",
+         "width": 3840, "height": 2160},
+    ]
+
+    assert MatroskaBuilder()._primary_video_pid(asset, streams) == 0x1011
+
+
+def test_primary_video_pid_does_not_expand_judgement_without_unique_carrier():
+    """宽高缺失也可能是探测失败；没有唯一替代候选时不扩大判定。"""
+    asset = BlurayTitleAsset(
+        root=Path("/tmp/disc.iso"),
+        entry_path="HDATHOME/MAIN_TITLE.m2ts",
+        title_index=2,
+        playlist=4,
+        duration_90k=926_395_470,
+        size=1,
+        clip_count=1,
+        source_kind="iso",
+        video_tracks=(BlurayTrack(index=0, pid=0x1011, coding_type=0x24,
+                                  language="und"),),
+    )
+    no_carrier = [{"codec_type": "video", "id": "0x1011", "width": 0, "height": 0}]
+    dv_style = [
+        {"codec_type": "video", "id": "0x1011", "width": 0, "height": 0},
+        {"codec_type": "video", "id": "0x1012", "width": 1920, "height": 1080},
+        {"codec_type": "video", "id": "0x1fff", "width": 3840, "height": 2160},
+    ]
+
+    builder = MatroskaBuilder()
+    assert builder._primary_video_pid(asset, no_carrier) == 0x1011
+    assert builder._primary_video_pid(asset, dv_style) == 0x1011
+
+
+def test_multiclip_context_is_appended_to_failure_reason():
+    """保守做法（2026-09-14 裁定）：连放结构照旧被拒，但理由必须自带该事实。"""
+    from bluray_fidelity.bluray import BlurayClip
+    from bluray_fidelity.matroska import _with_multiclip_context
+
+    single = BlurayTitleAsset(
+        root=Path("/tmp/disc.iso"), entry_path="HDATHOME/MAIN_TITLE.m2ts",
+        title_index=2, playlist=4, duration_90k=9_000_000, size=1, clip_count=1,
+        source_kind="iso",
+        clips=(BlurayClip(index=0, clip_id="00016", in_time=0, out_time=9_000_000),),
+    )
+    compilation = BlurayTitleAsset(
+        **{**single.__dict__, "clip_count": 3, "clips": (
+            BlurayClip(index=0, clip_id="00000", in_time=54_000_000,
+                       out_time=330_302_276),
+            BlurayClip(index=1, clip_id="00001", in_time=54_000_000,
+                       out_time=323_710_690),
+            BlurayClip(index=2, clip_id="00002", in_time=54_000_000,
+                       out_time=331_199_422),
+        )},
+    )
+
+    assert _with_multiclip_context("成品 seek 90% 时间越界", single) == \
+        "成品 seek 90% 时间越界"
+    noted = _with_multiclip_context("成品 seek 90% 时间越界", compilation)
+    assert noted.startswith("成品 seek 90% 时间越界｜主片为多 clip 合辑（连放结构）：")
+    assert "in=600.0s" in noted
+    assert "按单集来源投递" in noted
+
+
+# ---------------------------------------------------------------------------
+# 2026-09-17 多段追加（3 段）根因：`--append-to` 目标文件号 + mkvmerge 退出码语义。
+#
+# 生产标本 dlv_b3532c0cbbbe66742be8（地球脉动.第二季，3 个 play item）自 00:15
+# 起 9 次尝试都在 track_validation 40% 以同一条「最终 MKV 缺少有效时长/Cues
+# 信息」失败。逐环复核（本地真实 mkvmerge v100）证明它不是内容门缺陷：
+#   1) 3.7.93 生成的 `--append-to` 把目标文件号硬编码为 0（`<源>:<轨>:0:<轨>`），
+#      两段追加时正确，第 3 个输入起与第 2 个冲突 → mkvmerge 报
+#      `More than one track is to be appended to the track N from file no. 0`
+#      并以退出码 2（**错误**）中止、不产出任何文件；
+#   2) 退出码语义被写反（把 2 当"已完成但有警告"），于是硬失败被当警告放行；
+#   3) `_run_mkvmerge_identify` 同样接受 2，把 mkvmerge 对不存在文件写进 stdout
+#      的错误 JSON 当成有效识别；ffprobe 对不存在文件返回 0；
+#   4) 成品门于是报「缺少有效时长/Cues」——"根本没有成品"伪装成"成品缺字段"。
+# ---------------------------------------------------------------------------
+
+
+def _final_identification(*, duration_ns):
+    """可被 validate_finalized_identification 接受的成品识别（单视频轨）。"""
+    properties = {"duration": duration_ns} if duration_ns is not None else {}
+    return {
+        "container": {"properties": properties},
+        "tracks": [
+            {"id": 0, "type": "video", "codec": "HEVC/H.265/MPEG-H", "properties": {}},
+            {"id": 1, "type": "audio", "codec": "TrueHD", "properties": {"language": "eng"}},
+            {"id": 2, "type": "audio", "codec": "AC-3", "properties": {"language": "zho"}},
+            {"id": 3, "type": "subtitles", "codec": "HDMV PGS", "properties": {"language": "eng"}},
+            {"id": 4, "type": "subtitles", "codec": "HDMV PGS", "properties": {"language": "zho"}},
+        ],
+    }
+
+
+def test_command_three_item_append_targets_previous_file(tmp_path):
+    """3 段以上追加：`--append-to` 的目标文件号必须是**前一段**（file N → N-1）。
+
+    旧实现把目标文件号硬编码为 0：两段时恰好正确（3.7.93 就是在两段标题上验证
+    通过的），第 3 个输入起 `2:<轨>:0:<轨>` 与 `1:<轨>:0:<轨>` 冲突，mkvmerge
+    以退出码 2 中止、不产出文件（生产 3 段标本 9 次重投的定因）。
+    """
+    asset = _asset(tmp_path)
+    resolved = resolve_official_tracks(asset, parse_identification(_input_identification()))
+    first = tmp_path / "title.item0.m2ts"
+    extras = (tmp_path / "title.item1.m2ts", tmp_path / "title.item2.m2ts")
+
+    command = build_mkvmerge_command(
+        asset, resolved, first, tmp_path / "final.mkv.partial",
+        title="合辑", append_inputs=extras,
+    )
+
+    mapping = command[command.index("--append-to") + 1]
+    entries = mapping.split(",")
+    # 第 2 个输入 → 目标文件 0；第 3 个输入 → 目标文件 1（前一段）。
+    for track_id in (0, 1, 2, 4, 5, 6):
+        assert f"1:{track_id}:0:{track_id}" in entries
+        assert f"2:{track_id}:1:{track_id}" in entries
+    # 绝不能把两个源文件追加到同一条目标轨（mkvmerge 会直接报错退出）。
+    assert not any(
+        entry.startswith("2:") and entry.split(":")[2] == "0" for entry in entries
+    ), f"第 3 个输入不许再映射到 file 0：{mapping}"
+
+
+def test_identify_error_exit_code_fails_closed(monkeypatch, tmp_path):
+    """mkvmerge --identify 退出码 2=错误：失败关闭并带原文。
+
+    对未产出/打不开的成品，mkvmerge 把错误写进 stdout 的 JSON 并以 2 返回。
+    旧实现接受 2、把该 JSON 当有效识别，最终在成品门报「缺少有效时长/Cues」。
+    """
+    import bluray_fidelity.matroska as m
+
+    class FakeRun:
+        returncode = 2
+        stderr = ""
+        stdout = json.dumps(
+            {"errors": ["The file '/x/out.mkv' could not be opened for reading: open file error."]}
+        )
+
+    monkeypatch.setattr(m.subprocess, "run", lambda *a, **k: FakeRun())
+    with pytest.raises(MatroskaBuildError, match=r"最终 MKV 校验失败（退出码 2）"):
+        MatroskaBuilder._run_mkvmerge_identify(
+            "mkvmerge", tmp_path / "out.mkv", label="最终 MKV 校验",
+        )
+
+
+def test_identified_container_guard_is_fail_closed():
+    """识别结果是错误 JSON / 明确未识别 → 在时长门前失败关闭，不被当成缺字段。"""
+    import bluray_fidelity.matroska as m
+
+    with pytest.raises(MatroskaBuildError, match="未产出可识别的容器"):
+        m._require_identified_container(
+            {"errors": ["The file 'x.mkv' could not be opened for reading: open file error."]},
+            label="最终 MKV 校验",
+        )
+    with pytest.raises(MatroskaBuildError, match="未识别出有效的 Matroska 容器"):
+        m._require_identified_container(
+            {"container": {"recognized": False}}, label="最终 MKV 校验",
+        )
+    # 正常识别（老版本无 recognized 字段也放行）→ 通过。
+    m._require_identified_container(
+        {"container": {"properties": {"duration": 1}}}, label="最终 MKV 校验",
+    )
+
+
+def test_mux_error_surfaces_as_mkvmerge_failure_not_duration_gate(tmp_path, monkeypatch):
+    """3 段 mkvmerge 以退出码 2 中止（无成品）时，必须报 mkvmerge 失败原文，
+    绝不能走到成品门报「最终 MKV 缺少有效时长/Cues 信息」。
+
+    这正是生产标本 dlv_b3532c0cbbbe66742be8 的症状链：非法映射 → mkvmerge 中止
+    → 无文件 → identify 错误 JSON 被当有效识别 → 时长门报缺字段 → 无限重投。
+    """
+    import bluray_fidelity.matroska as m
+    from bluray_fidelity.matroska import MatroskaBuilder
+
+    asset = _multiclip_asset(tmp_path)
+    _install_multiclip_reader(monkeypatch)
+    output = tmp_path / "final.mkv.partial"
+
+    class FakeProcess:
+        stdout = iter((
+            "Error: More than one track is to be appended to the track 0 from "
+            "file no. 0 ('item0.m2ts'). The argument for '--append-to' was invalid.\n",
+        ))
+
+        def wait(self):
+            return 2
+
+    class FakeRun:
+        # mkvmerge --identify 对不存在的成品：错误 JSON + 退出码 2。
+        returncode = 2
+        stderr = ""
+        stdout = json.dumps(
+            {"errors": ["The file could not be opened for reading: open file error."]}
+        )
+
+    builder = MatroskaBuilder()
+    monkeypatch.setattr(m.shutil, "which", lambda _name: "/usr/bin/mkvmerge")
+    monkeypatch.setattr(builder, "_identify_path", lambda _source: _input_identification())
+    monkeypatch.setattr(builder, "_video_streams", lambda _source: _b2_streams())
+    monkeypatch.setattr(builder, "_has_hdr10plus", lambda _source: False)
+    monkeypatch.setattr(m.subprocess, "Popen", lambda *a, **k: FakeProcess())
+    monkeypatch.setattr(m.subprocess, "run", lambda *a, **k: FakeRun())
+
+    with pytest.raises(MatroskaBuildError) as error:
+        builder.build(asset, output, title="合辑")
+
+    message = str(error.value)
+    assert "mkvmerge 生成失败（退出码 2）" in message
+    assert "More than one track" in message
+    assert "缺少有效时长" not in message, "硬封装失败不得再伪装成成品时长门失败"
+
+
+def _build_multiclip_with_final_identify(monkeypatch, tmp_path, *, identify_payload,
+                                         probe_duration):
+    """多段路线走真实成品门（validate_finalized_identification）的最小装置。"""
+    import bluray_fidelity.matroska as m
+    from bluray_fidelity.matroska import MatroskaBuilder
+
+    asset = _multiclip_asset(tmp_path)
+    _install_multiclip_reader(monkeypatch)
+    output = tmp_path / "final.mkv.partial"
+
+    class FakeProcess:
+        stdout = iter(())
+
+        def wait(self):
+            return 0
+
+    class FakeRun:
+        returncode = 0
+        stderr = ""
+        stdout = json.dumps(identify_payload)
+
+    builder = MatroskaBuilder()
+    monkeypatch.setattr(m.shutil, "which", lambda _name: "/usr/bin/mkvmerge")
+    monkeypatch.setattr(builder, "_identify_path", lambda _source: _input_identification())
+    monkeypatch.setattr(builder, "_video_streams", lambda _source: _b2_streams())
+    monkeypatch.setattr(builder, "_has_hdr10plus", lambda _source: False)
+    monkeypatch.setattr(m.subprocess, "Popen", lambda *a, **k: FakeProcess())
+    monkeypatch.setattr(m.subprocess, "run", lambda *a, **k: FakeRun())
+    monkeypatch.setattr(m, "_probe_duration", lambda _probe, _path: probe_duration)
+    # 覆盖门需要真实成品里的媒体包；本装置只提供识别 JSON（见 _run_multiclip_build
+    # 处的同一条说明）。这里的断言目标是"缺容器时长时用独立探针补齐后仍放行"。
+    monkeypatch.setattr(m, "require_track_coverage", lambda *a, **k: {})
+    monkeypatch.setattr(MatroskaBuilder, "_verify_multiclip_seams", lambda *a, **k: None)
+    return builder.build(asset, output, title="合辑")
+
+
+def test_multiclip_without_container_duration_but_probe_measurable_is_accepted(
+    tmp_path, monkeypatch,
+):
+    """结构完好但 mkvmerge 未写容器时长：独立探针测得出 → 放行（3.7.84 不变量）。"""
+    result = _build_multiclip_with_final_identify(
+        monkeypatch, tmp_path,
+        identify_payload=_final_identification(duration_ns=None),
+        probe_duration=900.0,
+    )
+    assert int(result["duration_ns"]) == 900_000_000_000
+
+
+def test_multiclip_truncated_unmeasurable_output_is_rejected(tmp_path, monkeypatch):
+    """截断/损坏：mkvmerge 与 ffprobe 都测不出时长 → 成品门失败关闭（零放宽）。"""
+    with pytest.raises(MatroskaBuildError, match="缺少有效时长/Cues"):
+        _build_multiclip_with_final_identify(
+            monkeypatch, tmp_path,
+            identify_payload=_final_identification(duration_ns=None),
+            probe_duration=0.0,
+        )
+
+
+def test_real_mkvmerge_three_item_append_previous_file_target(tmp_path):
+    """真实 mkvmerge：修正后的 3 段映射 exit=0 且成品带时长；旧映射（目标号 0）
+    以退出码 2 中止、不产出文件。跳过：本机无 mkvmerge/ffmpeg/ffprobe。"""
+    import shutil
+    import subprocess
+
+    if not all(shutil.which(tool) for tool in ("mkvmerge", "ffmpeg", "ffprobe")):
+        pytest.skip("需要真实 mkvmerge/ffmpeg/ffprobe")
+
+    from bluray_fidelity.matroska import ResolvedTracks
+
+    for index in range(3):
+        subprocess.run(
+            ["ffmpeg", "-hide_banner", "-loglevel", "error", "-y",
+             "-f", "lavfi", "-i", "testsrc2=size=160x120:rate=25",
+             "-f", "lavfi", "-i", "sine=frequency=440", "-t", "1",
+             "-c:v", "libx264", "-pix_fmt", "yuv420p", "-c:a", "aac",
+             "-f", "mpegts", str(tmp_path / f"item{index}.ts")],
+            check=True,
+        )
+    items = [tmp_path / f"item{index}.ts" for index in range(3)]
+
+    asset = replace(
+        _asset(tmp_path),
+        audio_tracks=(BlurayTrack(index=0, pid=4352, coding_type=0x81, language="eng"),),
+        subtitle_tracks=(),
+    )
+    resolved = ResolvedTracks(
+        video_ids=(0,), audio_ids=(1,), subtitle_ids=(),
+        audio_by_official_index=((0, 1),), subtitle_by_official_index=(),
+    )
+    mkvmerge = shutil.which("mkvmerge")
+
+    good_out = tmp_path / "good.mkv"
+    good = build_mkvmerge_command(
+        asset, resolved, items[0], good_out, title="t",
+        append_inputs=(items[1], items[2]),
+    )
+    good[0] = mkvmerge
+    completed = subprocess.run(good, capture_output=True, text=True)
+    assert completed.returncode == 0, completed.stdout + completed.stderr
+    identified = json.loads(subprocess.run(
+        [mkvmerge, "--identification-format", "json", "--identify", str(good_out)],
+        capture_output=True, text=True,
+    ).stdout)
+    assert int(identified["container"]["properties"]["duration"]) > 0
+
+    # 旧形态（第 3 个输入的目标文件号 = 0）：mkvmerge 判非法并以退出码 2 中止。
+    bad_out = tmp_path / "bad.mkv"
+    bad = list(good)
+    bad[bad.index("--output") + 1] = str(bad_out)
+    mapping_at = bad.index("--append-to") + 1
+    bad[mapping_at] = ",".join(
+        part.replace(":1:", ":0:", 1) if part.startswith("2:") else part
+        for part in bad[mapping_at].split(",")
+    )
+    failed = subprocess.run(bad, capture_output=True, text=True)
+    assert failed.returncode == 2
+    assert "More than one track" in (failed.stdout + failed.stderr)
+    assert not bad_out.exists(), "mkvmerge 以错误中止时不得留下成品"

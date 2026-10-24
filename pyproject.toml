@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "bluray-mkv-fidelity"
-version = "0.1.1"
+version = "0.2.0"
 description = "Dolby Vision Profile 7 保真交付工具链 — 从 Blu-ray BDMV/ISO 精确还原 MKV"
 readme = "README.md"
 license = "Apache-2.0"
