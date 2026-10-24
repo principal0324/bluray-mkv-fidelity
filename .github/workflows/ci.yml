@@ -8,7 +8,9 @@ on:
 
 jobs:
   test:
-    runs-on: ubuntu-latest
+    # ubuntu-latest migrated to Ubuntu 26 on 2026-10-19; pinned to 24.04 while
+    # hosted runners intermittently lose communication (runs #3-#5 all hung ~45m)
+    runs-on: ubuntu-24.04
     strategy:
       matrix:
         python-version: ["3.10", "3.11", "3.12", "3.13"]
